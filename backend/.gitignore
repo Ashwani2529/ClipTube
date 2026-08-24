@@ -3,3 +3,4 @@ dist/
 temp/
 .env
 *.log
+.env.example

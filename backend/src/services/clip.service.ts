@@ -51,11 +51,32 @@ function containerForAudioCodec(acodec: string | null | undefined, sourceExt: st
 /**
  * A video-only format has to be merged with an audio track. Preferring m4a audio keeps
  * the mp4 merge a straight stream copy instead of a transcode.
+ *
+ * Every selector ends in a generic fallback because the format list and the download are
+ * separate yt-dlp runs, and YouTube does not offer every format to every player client —
+ * so the exact id can be gone by download time. The video fallback is capped at the
+ * requested height so a missing 480p degrades to something comparable, never to 4K.
  */
-function buildFormatSelector(type: ClipType, formatId: string, hasAudio: boolean): string {
-  if (type === 'audio') return formatId;
-  if (hasAudio) return formatId;
-  return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}`;
+function buildFormatSelector(
+  type: ClipType,
+  formatId: string,
+  hasAudio: boolean,
+  height: number | null,
+): string {
+  if (type === 'audio') {
+    return `${formatId}/bestaudio/best`;
+  }
+
+  const exact = hasAudio
+    ? formatId
+    : `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}`;
+
+  const capped =
+    height && height > 0
+      ? `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`
+      : 'bestvideo+bestaudio/best';
+
+  return `${exact}/${capped}`;
 }
 
 /**
@@ -205,7 +226,12 @@ export async function processJob(jobId: string): Promise<void> {
       type === 'video' ? 'mp4' : containerForAudioCodec(format.acodec, format.ext ?? 'm4a');
 
     const mergesAudio = type === 'video' && !hasAudio;
-    const formatSelector = buildFormatSelector(type, job.formatId, hasAudio);
+    const formatSelector = buildFormatSelector(
+      type,
+      job.formatId,
+      hasAudio,
+      format.height ?? null,
+    );
     const outputTemplate = path.join(directory, `${SOURCE_STEM}.%(ext)s`);
     const mergeContainer = type === 'video' ? ('mp4' as const) : null;
     const onProgress = (percent: number) =>

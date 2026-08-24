@@ -210,42 +210,77 @@ function isBlockedByYoutube(error: unknown): boolean {
   );
 }
 
+/**
+ * True when this player client answered but gave us nothing to download. Some clients
+ * return metadata with the stream URLs withheld, so format selection finds no candidates
+ * — even on a plain `-J`, which still applies the default selector. That is a dead end for
+ * the client, not for the video, so it's worth retrying on a different one.
+ */
+function isFormatUnavailable(error: unknown): boolean {
+  if (!(error instanceof ProcessError)) return false;
+  const stderr = error.stderr.toLowerCase();
+  return (
+    stderr.includes('requested format is not available') ||
+    stderr.includes('no video formats found') ||
+    stderr.includes('unable to extract player response')
+  );
+}
+
 /** Index into env.ytdlp.playerClients for the client the next call will use. */
 let clientCursor = 0;
 
 /**
- * Moves to the next player client. Returns false once they are all spent, which resets
- * the cursor so the next request starts from the preferred client again.
+ * Advances to the next client, wrapping around. The cursor is deliberately sticky across
+ * requests so a client that works keeps being used, but it wraps so that a request which
+ * starts mid-list still gets to try the entries before it.
  */
-function rotatePlayerClient(): boolean {
-  // An explicit --extractor-args override means the operator is in charge; don't fight it.
-  if (env.ytdlp.extractorArgs) return false;
+function advancePlayerClient(reason: string): void {
+  const clients = env.ytdlp.playerClients;
+  if (clients.length === 0) return;
 
-  if (clientCursor + 1 >= env.ytdlp.playerClients.length) {
-    clientCursor = 0;
-    return false;
-  }
-
-  clientCursor += 1;
-  logger.warn(
-    `YouTube blocked the request — retrying with player_client=${env.ytdlp.playerClients[clientCursor]}.`,
-  );
-  return true;
+  clientCursor = (clientCursor + 1) % clients.length;
+  logger.warn(`${reason} — retrying with player_client=${clients[clientCursor]}.`);
 }
 
 /**
  * Retries while YouTube keeps refusing us, escalating through the two levers we have:
- * first a different player client (cheap, no new network path), then a different proxy
- * (the loop yt-dlp-proxy runs). Non-block failures propagate immediately.
+ * first every player client in turn (cheap, no new network path), then a different proxy
+ * (the loop yt-dlp-proxy runs). Anything else propagates immediately.
+ *
+ * Each client is tried at most once per operation, so a video that genuinely has no
+ * usable formats fails after one pass instead of looping.
  */
 async function withUnblockRetries<T>(operation: () => Promise<T>): Promise<T> {
+  // An explicit --extractor-args override means the operator is in charge; don't fight it.
+  const clientBudget = env.ytdlp.extractorArgs
+    ? 1
+    : Math.max(1, env.ytdlp.playerClients.length);
+
+  let clientsTried = 1;
+
   for (;;) {
     try {
       return await operation();
     } catch (error) {
-      if (!isBlockedByYoutube(error)) throw error;
-      // Exhausting the clients resets the cursor, so the proxy retry starts fresh.
-      if (!rotatePlayerClient() && !rotateProxy()) throw error;
+      const blocked = isBlockedByYoutube(error);
+      const emptyClient = isFormatUnavailable(error);
+      if (!blocked && !emptyClient) throw error;
+
+      if (clientsTried < clientBudget) {
+        clientsTried += 1;
+        advancePlayerClient(
+          blocked ? 'YouTube blocked the request' : 'That client returned no usable formats',
+        );
+        continue;
+      }
+
+      // Out of clients: a new exit IP is the only thing left worth trying.
+      if (blocked && rotateProxy()) {
+        clientsTried = 1;
+        continue;
+      }
+
+      throw error;
     }
   }
 }
