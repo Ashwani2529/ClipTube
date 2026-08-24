@@ -10,7 +10,7 @@ export default defineConfig({
       // Keeps the API same-origin in dev: no CORS preflights, and file downloads
       // triggered by navigating to /api/download/:id just work.
       '/api': {
-        target: 'http://localhost:4000',
+        target: 'https://cliptube-ny8q.onrender.com',
         changeOrigin: true,
       },
     },
