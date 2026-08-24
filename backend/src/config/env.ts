@@ -51,8 +51,23 @@ export const env = {
     cookiesFile: str('YTDLP_COOKIES_FILE', ''),
     /** Proxy URL, passed as `--proxy`. A residential proxy also clears bot checks. */
     proxy: str('YTDLP_PROXY', ''),
-    /** Raw value for `--extractor-args`, e.g. `youtube:player_client=tv,web_safari`. */
+    /**
+     * Raw value for `--extractor-args`. Setting this takes full control and disables the
+     * player-client rotation below, so leave it blank unless you need a specific override.
+     */
     extractorArgs: str('YTDLP_EXTRACTOR_ARGS', ''),
+
+    /**
+     * YouTube player clients to try, in order. Each is passed as
+     * `--extractor-args youtube:player_client=<name>`, and a bot-checked request advances
+     * to the next one. `default` is yt-dlp's own tuned set and is deliberately first —
+     * which client survives the bot check changes with every YouTube and yt-dlp release,
+     * so this is a list rather than a single hard-coded value.
+     */
+    playerClients: str('YTDLP_PLAYER_CLIENTS', 'default,mweb,web_safari,tv_simply,android_vr')
+      .split(',')
+      .map((name) => name.trim())
+      .filter(Boolean),
 
     /**
      * Harvest free public proxies, validate them against YouTube, and rotate through

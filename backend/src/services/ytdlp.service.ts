@@ -47,6 +47,81 @@ export interface RawVideoInfo {
 let cookieFile: string | null = null;
 
 /**
+ * Cookies YouTube only sets for a signed-in session. A cookie file exported while logged
+ * out parses fine and is accepted by yt-dlp, but YouTube still treats the request as
+ * anonymous — which looks exactly like the bot check having ignored the cookies.
+ */
+const SIGNED_IN_COOKIES = [
+  'SID',
+  'HSID',
+  'SSID',
+  'APISID',
+  'SAPISID',
+  '__Secure-1PSID',
+  '__Secure-3PSID',
+  'LOGIN_INFO',
+];
+
+/**
+ * Reports what the cookie file actually contains. This is diagnosis only — nothing here
+ * blocks startup, because yt-dlp is the real authority on whether cookies work.
+ */
+async function inspectCookieFile(filePath: string): Promise<void> {
+  let contents: string;
+  try {
+    contents = await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    logger.warn(`Could not read the cookie file for inspection.`, error);
+    return;
+  }
+
+  const lines = contents.split(/\r?\n/).filter((line) => line.trim() && !line.startsWith('#'));
+
+  if (lines.length === 0) {
+    logger.warn('The cookie file has no cookie entries — YouTube will treat requests as anonymous.');
+    return;
+  }
+
+  // Netscape format is tab-separated: domain, flag, path, secure, expiry, name, value.
+  const names = new Set(
+    lines.map((line) => line.split('\t')[5]).filter((name): name is string => Boolean(name)),
+  );
+
+  if (names.size === 0) {
+    logger.warn(
+      'The cookie file is not tab-separated Netscape format. Re-export it with a ' +
+        '"Netscape/cookies.txt" exporter — yt-dlp cannot use JSON or header-string dumps.',
+    );
+    return;
+  }
+
+  const youtubeLines = lines.filter((line) => line.includes('youtube.com'));
+  const signedIn = SIGNED_IN_COOKIES.filter((name) => names.has(name));
+
+  if (youtubeLines.length === 0) {
+    logger.warn(
+      `The cookie file has ${lines.length} cookies but none for youtube.com — it was ` +
+        'probably exported from the wrong site.',
+    );
+    return;
+  }
+
+  if (signedIn.length === 0) {
+    logger.warn(
+      `The cookie file has ${youtubeLines.length} youtube.com cookies but none of the ` +
+        `signed-in session cookies (${SIGNED_IN_COOKIES.join(', ')}). It looks like a ` +
+        'logged-out export, which will not clear the bot check. Re-export while signed in.',
+    );
+    return;
+  }
+
+  logger.info(
+    `Cookie file looks signed in: ${youtubeLines.length} youtube.com cookies, ` +
+      `including ${signedIn.join(', ')}.`,
+  );
+}
+
+/**
  * `--cookies` is read *and written*: yt-dlp dumps the refreshed cookie jar back to the
  * file when it exits. Secret mounts are read-only (Render puts them in `/etc/secrets`),
  * so the configured file is copied somewhere writable and yt-dlp is pointed at the copy.
@@ -84,6 +159,8 @@ export async function prepareCookieFile(): Promise<void> {
       error,
     );
   }
+
+  await inspectCookieFile(cookieFile);
 }
 
 /**
@@ -96,11 +173,19 @@ function baseArgs(): string[] {
 
   if (cookieFile) args.push('--cookies', cookieFile);
 
-  // Read per call, not cached: rotation swaps this out between retries.
+  // Read per call, not cached: rotation swaps these out between retries.
   const proxy = activeProxy();
   if (proxy) args.push('--proxy', proxy);
 
-  if (env.ytdlp.extractorArgs) args.push('--extractor-args', env.ytdlp.extractorArgs);
+  if (env.ytdlp.extractorArgs) {
+    args.push('--extractor-args', env.ytdlp.extractorArgs);
+  } else {
+    const client = env.ytdlp.playerClients[clientCursor];
+    // `default` means "let yt-dlp choose", so no flag at all.
+    if (client && client !== 'default') {
+      args.push('--extractor-args', `youtube:player_client=${client}`);
+    }
+  }
 
   if (env.ytdlp.sleepInterval > 0) {
     args.push('--sleep-interval', String(env.ytdlp.sleepInterval));
@@ -125,17 +210,42 @@ function isBlockedByYoutube(error: unknown): boolean {
   );
 }
 
+/** Index into env.ytdlp.playerClients for the client the next call will use. */
+let clientCursor = 0;
+
 /**
- * Retries an operation across the proxy pool while YouTube keeps refusing us, the same
- * loop yt-dlp-proxy runs: try, detect the block in the output, switch proxy, try again.
- * Non-block failures propagate immediately.
+ * Moves to the next player client. Returns false once they are all spent, which resets
+ * the cursor so the next request starts from the preferred client again.
  */
-async function withProxyRotation<T>(operation: () => Promise<T>): Promise<T> {
+function rotatePlayerClient(): boolean {
+  // An explicit --extractor-args override means the operator is in charge; don't fight it.
+  if (env.ytdlp.extractorArgs) return false;
+
+  if (clientCursor + 1 >= env.ytdlp.playerClients.length) {
+    clientCursor = 0;
+    return false;
+  }
+
+  clientCursor += 1;
+  logger.warn(
+    `YouTube blocked the request — retrying with player_client=${env.ytdlp.playerClients[clientCursor]}.`,
+  );
+  return true;
+}
+
+/**
+ * Retries while YouTube keeps refusing us, escalating through the two levers we have:
+ * first a different player client (cheap, no new network path), then a different proxy
+ * (the loop yt-dlp-proxy runs). Non-block failures propagate immediately.
+ */
+async function withUnblockRetries<T>(operation: () => Promise<T>): Promise<T> {
   for (;;) {
     try {
       return await operation();
     } catch (error) {
-      if (!isBlockedByYoutube(error) || !rotateProxy()) throw error;
+      if (!isBlockedByYoutube(error)) throw error;
+      // Exhausting the clients resets the cursor, so the proxy retry starts fresh.
+      if (!rotatePlayerClient() && !rotateProxy()) throw error;
     }
   }
 }
@@ -197,7 +307,7 @@ function describeFailure(error: unknown): string {
 /** Fetches the full metadata blob (`yt-dlp -J`) for a single video. */
 export async function fetchVideoInfo(url: string): Promise<RawVideoInfo> {
   try {
-    const { stdout } = await withProxyRotation(() =>
+    const { stdout } = await withUnblockRetries(() =>
       run(YTDLP_PATH, [...baseArgs(), '--no-progress', '-J', url], { timeoutMs: 90_000 }),
     );
     const parsed = JSON.parse(stdout) as RawVideoInfo;
@@ -326,7 +436,7 @@ async function attemptSection(
   const stopTracking = trackDiskProgress(options);
 
   try {
-    await withProxyRotation(async () => {
+    await withUnblockRetries(async () => {
       // Each attempt starts from a clean directory so a blocked run leaves nothing behind.
       await clearWorkDir(options.outputTemplate);
 
@@ -438,7 +548,7 @@ export async function downloadFullFormat(options: DownloadFormatOptions): Promis
   const stopTracking = trackDiskProgress(options);
 
   try {
-    await withProxyRotation(async () => {
+    await withUnblockRetries(async () => {
       await clearWorkDir(options.outputTemplate);
 
       return run(YTDLP_PATH, buildArgs(), {
