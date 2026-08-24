@@ -7,8 +7,8 @@ import { slugify } from '../lib/slugify';
 import { probe, remux } from '../lib/ffmpeg';
 import { HttpError, badRequest, notFound } from '../lib/errors';
 import { Job, type ClipType, type JobDocument } from '../models/Job';
-import { downloadSection } from './ytdlp.service';
-import { findFormat, getVideoInfo, toMeta } from './formats.service';
+import { downloadSection, type RawFormat, type RawVideoInfo } from './ytdlp.service';
+import { findFormat, getVideoInfo, mergeAudioSize, toMeta } from './formats.service';
 
 /** Sub-directory per job keeps the human-readable filename collision-free. */
 export const jobDirectory = (jobId: string): string => path.join(env.tempDir, jobId);
@@ -50,6 +50,25 @@ function buildFormatSelector(type: ClipType, formatId: string, hasAudio: boolean
   if (type === 'audio') return formatId;
   if (hasAudio) return formatId;
   return `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}`;
+}
+
+/**
+ * Scales the whole-video size yt-dlp reports down to the requested section, adding the
+ * audio track for video-only formats since those get merged. Used only to drive the
+ * progress bar, so a rough number is fine; null when yt-dlp reported no size at all.
+ */
+function estimateSectionBytes(
+  format: RawFormat,
+  info: RawVideoInfo,
+  clipSeconds: number,
+  includeMergedAudio: boolean,
+): number | null {
+  const videoDuration = info.duration ?? 0;
+  const fullBytes = format.filesize ?? format.filesize_approx ?? null;
+  if (!fullBytes || videoDuration <= 0 || clipSeconds <= 0) return null;
+
+  const audioBytes = includeMergedAudio ? mergeAudioSize(info.formats ?? []) : 0;
+  return (fullBytes + audioBytes) * Math.min(1, clipSeconds / videoDuration);
 }
 
 /**
@@ -186,6 +205,12 @@ export async function processJob(jobId: string): Promise<void> {
       endSeconds: job.end,
       outputTemplate: path.join(directory, `${SOURCE_STEM}.%(ext)s`),
       mergeContainer: type === 'video' ? 'mp4' : null,
+      expectedBytes: estimateSectionBytes(
+        format,
+        info,
+        job.end - job.start,
+        type === 'video' && !hasAudio,
+      ),
       onProgress: (percent) =>
         reportProgress((percent / 100) * DOWNLOAD_PROGRESS_CEILING),
     });

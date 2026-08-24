@@ -173,6 +173,11 @@ export interface DownloadSectionOptions {
   outputTemplate: string;
   mergeContainer?: 'mp4' | null;
   onProgress?: (percent: number) => void;
+  /**
+   * Estimated final size. Section downloads run through ffmpeg, which reports no
+   * percentage, so bytes-on-disk against this estimate is the only progress signal.
+   */
+  expectedBytes?: number | null;
   timeoutMs?: number;
 }
 
@@ -220,21 +225,64 @@ async function clearWorkDir(outputTemplate: string): Promise<void> {
   await fs.mkdir(directory, { recursive: true });
 }
 
+/** Total bytes of the files yt-dlp has written into the work directory so far. */
+async function bytesOnDisk(directory: string): Promise<number> {
+  const entries = await fs.readdir(directory, { withFileTypes: true });
+
+  const sizes = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile())
+      .map(async (entry) => {
+        const stat = await fs.stat(path.join(directory, entry.name)).catch(() => null);
+        return stat?.size ?? 0;
+      }),
+  );
+
+  return sizes.reduce((total, size) => total + size, 0);
+}
+
+/**
+ * Polls the work directory and turns bytes written into a percentage. This is what
+ * actually drives the progress bar for section downloads, since yt-dlp's own progress
+ * hook stays silent while ffmpeg does the fetching.
+ */
+function trackDiskProgress(options: DownloadSectionOptions): () => void {
+  const expected = options.expectedBytes ?? 0;
+  if (expected <= 0 || !options.onProgress) return () => undefined;
+
+  const directory = path.dirname(options.outputTemplate);
+  const timer = setInterval(() => {
+    void bytesOnDisk(directory)
+      .then((bytes) => {
+        // Capped below 100 so the bar never claims completion before the process exits.
+        options.onProgress?.(Math.min(99, (bytes / expected) * 100));
+      })
+      .catch(() => undefined);
+  }, 1000);
+
+  return () => clearInterval(timer);
+}
+
 async function attemptSection(
   options: DownloadSectionOptions,
   forceKeyframes: boolean,
 ): Promise<void> {
   await clearWorkDir(options.outputTemplate);
+  const stopTracking = trackDiskProgress(options);
 
-  await run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
-    timeoutMs: options.timeoutMs ?? 20 * 60_000,
-    onStdoutLine: (line) => {
-      const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
-      if (match && options.onProgress) {
-        options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
-      }
-    },
-  });
+  try {
+    await run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
+      timeoutMs: options.timeoutMs ?? 20 * 60_000,
+      onStdoutLine: (line) => {
+        const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
+        if (match && options.onProgress) {
+          options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
+        }
+      },
+    });
+  } finally {
+    stopTracking();
+  }
 }
 
 /**

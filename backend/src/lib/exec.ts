@@ -38,6 +38,10 @@ export function run(command: string, args: string[], options: RunOptions = {}): 
       cwd: options.cwd,
       windowsHide: true,
       shell: false,
+      // stdin is closed, not piped: ffmpeg reads stdin when it wants to ask about
+      // overwriting a file, and against an open-but-silent pipe it would wait forever.
+      // With 'ignore' any such read hits EOF and the process carries on.
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     let stdout = '';

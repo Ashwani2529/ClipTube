@@ -351,8 +351,19 @@ function clipSize(fullBytes: number | null): string | null {
                 <p class="foot-done">Saved{{ jobFileName ? ` as ${jobFileName}` : '' }}.</p>
               </template>
               <template v-else-if="busy">
-                <div class="progress" role="progressbar" :aria-valuenow="jobProgress">
-                  <div class="progress-fill" :style="{ width: `${jobProgress}%` }" />
+                <div
+                  class="progress"
+                  role="progressbar"
+                  :aria-valuenow="jobProgress > 0 ? jobProgress : undefined"
+                >
+                  <!-- Until yt-dlp reports a size there is no percentage to show, so the
+                       bar runs indeterminate rather than sitting at a frozen-looking 0%. -->
+                  <div
+                    v-if="jobProgress > 0"
+                    class="progress-fill"
+                    :style="{ width: `${jobProgress}%` }"
+                  />
+                  <div v-else class="progress-pending" />
                 </div>
                 <p class="foot-message">{{ jobMessage }}</p>
               </template>
@@ -678,6 +689,24 @@ function clipSize(fullBytes: number | null): string | null {
   border-radius: var(--radius-pill);
   background: var(--accent);
   transition: width 0.3s var(--ease);
+}
+
+.progress-pending {
+  height: 100%;
+  width: 35%;
+  border-radius: var(--radius-pill);
+  background: var(--accent);
+  opacity: 0.55;
+  animation: progress-slide 1.4s var(--ease) infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(286%);
+  }
 }
 
 .dialog-enter-active,

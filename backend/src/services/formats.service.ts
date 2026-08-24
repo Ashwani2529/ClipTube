@@ -78,7 +78,7 @@ function scoreVideo(format: RawFormat): number {
  * `bestaudio[ext=m4a]/bestaudio` selector the clip service uses. Without this, a
  * video-only entry would under-report the size of the file the user actually gets.
  */
-function mergeAudioSize(formats: RawFormat[]): number {
+export function mergeAudioSize(formats: RawFormat[]): number {
   const audioOnly = formats.filter(
     (format) => isUsable(format) && isPresent(format.acodec) && !isPresent(format.vcodec),
   );
