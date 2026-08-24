@@ -1,5 +1,5 @@
 import { ProcessError, run } from '../lib/exec';
-import { resolveBinary } from '../lib/binaries';
+import { FFMPEG_PATH, YTDLP_PATH } from '../lib/binaries';
 import { upstreamFailure } from '../lib/errors';
 import { logger } from '../lib/logger';
 
@@ -69,10 +69,8 @@ function describeFailure(error: unknown): string {
 
 /** Fetches the full metadata blob (`yt-dlp -J`) for a single video. */
 export async function fetchVideoInfo(url: string): Promise<RawVideoInfo> {
-  const { command } = await resolveBinary('yt-dlp');
-
   try {
-    const { stdout } = await run(command, [...BASE_ARGS, '--no-progress', '-J', url], {
+    const { stdout } = await run(YTDLP_PATH, [...BASE_ARGS, '--no-progress', '-J', url], {
       timeoutMs: 90_000,
     });
     const parsed = JSON.parse(stdout) as RawVideoInfo;
@@ -112,15 +110,13 @@ const PROGRESS_PATTERN = /^progress:\s*(\d+(?:\.\d+)?)$/;
  * starts exactly where the user asked instead of snapping to the previous keyframe.
  */
 export async function downloadSection(options: DownloadSectionOptions): Promise<void> {
-  const { command } = await resolveBinary('yt-dlp');
-  const ffmpeg = await resolveBinary('ffmpeg');
-
   const section = `*${options.startSeconds.toFixed(3)}-${options.endSeconds.toFixed(3)}`;
 
   const args = [
     ...BASE_ARGS,
+    // yt-dlp needs ffmpeg for section cuts and merging; point it at the bundled one.
     '--ffmpeg-location',
-    ffmpeg.command,
+    FFMPEG_PATH,
     '-f',
     options.formatSelector,
     '--download-sections',
@@ -143,7 +139,7 @@ export async function downloadSection(options: DownloadSectionOptions): Promise<
   args.push(options.url);
 
   try {
-    await run(command, args, {
+    await run(YTDLP_PATH, args, {
       timeoutMs: options.timeoutMs ?? 20 * 60_000,
       onStdoutLine: (line) => {
         const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());

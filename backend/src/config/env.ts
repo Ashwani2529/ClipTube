@@ -35,10 +35,4 @@ export const env = {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
-
-  binaries: {
-    ytDlp: str('YTDLP_PATH', ''),
-    ffmpeg: str('FFMPEG_PATH', ''),
-    ffprobe: str('FFPROBE_PATH', ''),
-  },
 } as const;

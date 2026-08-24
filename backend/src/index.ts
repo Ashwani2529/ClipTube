@@ -3,15 +3,16 @@ import type { Server } from 'http';
 import { createApp } from './app';
 import { env } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/db';
-import { verifyBinaries } from './lib/binaries';
+import { BINARY_PATHS } from './lib/binaries';
 import { logger } from './lib/logger';
 import { startCleanupSchedule, stopCleanupSchedule } from './services/cleanup.service';
 
 async function bootstrap(): Promise<void> {
   logger.info('Starting ClipTube API…');
 
-  // Fail fast and loudly: without yt-dlp/ffmpeg nothing this server does works.
-  await verifyBinaries();
+  Object.entries(BINARY_PATHS).forEach(([name, binaryPath]) => {
+    logger.info(`${name}: ${binaryPath}`);
+  });
 
   await fs.mkdir(env.tempDir, { recursive: true });
   logger.info(`Temp directory: ${env.tempDir}`);

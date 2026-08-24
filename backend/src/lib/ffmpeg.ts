@@ -1,22 +1,10 @@
 import Ffmpeg from 'fluent-ffmpeg';
-import { resolveBinary } from './binaries';
+import { FFMPEG_PATH, FFPROBE_PATH } from './binaries';
 import { logger } from './logger';
 
-let configured = false;
-
-/** Points fluent-ffmpeg at the binaries the startup check resolved. */
-async function configure(): Promise<void> {
-  if (configured) return;
-
-  const [ffmpeg, ffprobe] = await Promise.all([
-    resolveBinary('ffmpeg'),
-    resolveBinary('ffprobe'),
-  ]);
-
-  Ffmpeg.setFfmpegPath(ffmpeg.command);
-  Ffmpeg.setFfprobePath(ffprobe.command);
-  configured = true;
-}
+// The npm-provided paths are known at import time, so this is a one-off at module load.
+Ffmpeg.setFfmpegPath(FFMPEG_PATH);
+Ffmpeg.setFfprobePath(FFPROBE_PATH);
 
 export interface ProbeResult {
   durationSeconds: number | null;
@@ -27,8 +15,6 @@ export interface ProbeResult {
 }
 
 export async function probe(filePath: string): Promise<ProbeResult> {
-  await configure();
-
   return new Promise((resolve, reject) => {
     Ffmpeg.ffprobe(filePath, (error, data) => {
       if (error) {
@@ -71,8 +57,6 @@ export interface RemuxOptions {
  * front for instant seeking, and trims any overshoot left by the keyframe-aligned cut.
  */
 export async function remux(options: RemuxOptions): Promise<void> {
-  await configure();
-
   const outputOptions =
     options.kind === 'video'
       ? ['-map', '0:v:0?', '-map', '0:a:0?', '-c', 'copy', '-movflags', '+faststart']
