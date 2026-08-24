@@ -16,6 +16,12 @@ function int(key: string, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function bool(key: string, fallback: boolean): boolean {
+  const raw = str(key, '').toLowerCase();
+  if (raw === '') return fallback;
+  return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
 const tempDirSetting = str('TEMP_DIR', 'temp');
 
 export const env = {
@@ -35,4 +41,24 @@ export const env = {
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
+
+  /**
+   * Escape hatches for YouTube's bot checks, which reject datacenter IPs far more often
+   * than home connections. All optional — blank means "don't pass the flag".
+   */
+  ytdlp: {
+    /** Netscape cookie file, passed as `--cookies`. The reliable fix for bot checks. */
+    cookiesFile: str('YTDLP_COOKIES_FILE', ''),
+    /** Proxy URL, passed as `--proxy`. A residential proxy also clears bot checks. */
+    proxy: str('YTDLP_PROXY', ''),
+    /** Raw value for `--extractor-args`, e.g. `youtube:player_client=tv,web_safari`. */
+    extractorArgs: str('YTDLP_EXTRACTOR_ARGS', ''),
+
+    /**
+     * Cut exactly at the requested timestamps by re-encoding the section
+     * (`--force-keyframes-at-cuts`). Accurate but slow and memory-hungry; turn it off on
+     * small instances to get fast keyframe-aligned cuts instead.
+     */
+    forceKeyframes: bool('YTDLP_FORCE_KEYFRAMES', true),
+  },
 } as const;

@@ -22,7 +22,7 @@ export async function incrementDownloadCount(by = 1): Promise<number> {
   const doc = await Stats.findOneAndUpdate(
     { key: GLOBAL_KEY },
     { $inc: { totalDownloads: by }, $setOnInsert: { key: GLOBAL_KEY } },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
+    { returnDocument: 'after', upsert: true, setDefaultsOnInsert: true },
   ).lean();
 
   return doc?.totalDownloads ?? 0;

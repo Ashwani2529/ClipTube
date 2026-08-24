@@ -137,6 +137,16 @@ const targetExtension = computed(() => {
   if (tab.value === 'audio') return selectedAudio.value?.group.ext ?? 'm4a'
   return 'mp4'
 })
+
+/**
+ * yt-dlp reports sizes for the whole video, so scale them down to the selected range —
+ * otherwise a 12-second clip advertises the full 40 MB download.
+ */
+function clipSize(fullBytes: number | null): string | null {
+  const total = meta.value?.durationSeconds ?? 0
+  if (!fullBytes || total <= 0) return null
+  return formatBytes(fullBytes * Math.min(1, clipSeconds.value / total))
+}
 </script>
 
 <template>
@@ -226,8 +236,12 @@ const targetExtension = computed(() => {
                         <template v-else> · audio merged in</template>
                       </span>
                     </span>
-                    <span v-if="formatBytes(option.filesizeBytes)" class="option-size mono">
-                      ~{{ formatBytes(option.filesizeBytes) }}
+                    <span
+                      v-if="clipSize(option.filesizeBytes)"
+                      class="option-size mono"
+                      title="Estimated size of the selected range"
+                    >
+                      ~{{ clipSize(option.filesizeBytes) }}
                     </span>
                   </label>
                 </li>
@@ -263,8 +277,12 @@ const targetExtension = computed(() => {
                           <template v-if="tier.note"> · {{ tier.note }}</template>
                         </span>
                       </span>
-                      <span v-if="formatBytes(tier.filesizeBytes)" class="option-size mono">
-                        ~{{ formatBytes(tier.filesizeBytes) }}
+                      <span
+                        v-if="clipSize(tier.filesizeBytes)"
+                        class="option-size mono"
+                        title="Estimated size of the selected range"
+                      >
+                        ~{{ clipSize(tier.filesizeBytes) }}
                       </span>
                     </label>
                   </li>

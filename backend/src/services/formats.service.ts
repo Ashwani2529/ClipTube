@@ -73,7 +73,28 @@ function scoreVideo(format: RawFormat): number {
   return extScore + codecScore + protocolScore + Math.min(bitrate, 999) / 1000;
 }
 
+/**
+ * Size of the audio track that would be merged into a video-only format, matching the
+ * `bestaudio[ext=m4a]/bestaudio` selector the clip service uses. Without this, a
+ * video-only entry would under-report the size of the file the user actually gets.
+ */
+function mergeAudioSize(formats: RawFormat[]): number {
+  const audioOnly = formats.filter(
+    (format) => isUsable(format) && isPresent(format.acodec) && !isPresent(format.vcodec),
+  );
+
+  const preferred = audioOnly.filter((format) => format.ext === 'm4a');
+  const pool = preferred.length > 0 ? preferred : audioOnly;
+
+  const best = pool
+    .slice()
+    .sort((a, b) => (b.abr ?? b.tbr ?? 0) - (a.abr ?? a.tbr ?? 0))[0];
+
+  return best ? (sizeOf(best) ?? 0) : 0;
+}
+
 function buildVideoOptions(formats: RawFormat[]): VideoFormatOption[] {
+  const audioSize = mergeAudioSize(formats);
   const byHeight = new Map<number, RawFormat>();
 
   formats
@@ -91,6 +112,8 @@ function buildVideoOptions(formats: RawFormat[]): VideoFormatOption[] {
     .map(([height, format]) => {
       const fps = format.fps ? Math.round(format.fps) : null;
       const hdr = Boolean(format.dynamic_range && format.dynamic_range !== 'SDR');
+      const hasAudio = isPresent(format.acodec);
+      const videoSize = sizeOf(format);
 
       return {
         formatId: format.format_id as string,
@@ -100,8 +123,9 @@ function buildVideoOptions(formats: RawFormat[]): VideoFormatOption[] {
         fps,
         ext: format.ext ?? 'mp4',
         vcodec: shortCodec(format.vcodec),
-        hasAudio: isPresent(format.acodec),
-        filesizeBytes: sizeOf(format),
+        hasAudio,
+        // Whole-video size; the client scales it down to the selected range.
+        filesizeBytes: videoSize === null ? null : videoSize + (hasAudio ? 0 : audioSize),
         note: format.format_note ?? null,
         hdr,
       } satisfies VideoFormatOption;

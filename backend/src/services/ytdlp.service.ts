@@ -1,7 +1,11 @@
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { ProcessError, run } from '../lib/exec';
 import { FFMPEG_PATH, YTDLP_PATH } from '../lib/binaries';
 import { upstreamFailure } from '../lib/errors';
 import { logger } from '../lib/logger';
+import { env } from '../config/env';
 
 /** The subset of yt-dlp's `-J` output this app relies on. */
 export interface RawFormat {
@@ -38,7 +42,70 @@ export interface RawVideoInfo {
   formats?: RawFormat[];
 }
 
-const BASE_ARGS = ['--no-playlist', '--no-warnings', '--ignore-config'];
+/** Writable copy of the configured cookie file; see prepareCookieFile(). */
+let cookieFile: string | null = null;
+
+/**
+ * `--cookies` is read *and written*: yt-dlp dumps the refreshed cookie jar back to the
+ * file when it exits. Secret mounts are read-only (Render puts them in `/etc/secrets`),
+ * so the configured file is copied somewhere writable and yt-dlp is pointed at the copy.
+ *
+ * Failures here are not fatal — we fall back to the original path and let yt-dlp decide.
+ */
+export async function prepareCookieFile(): Promise<void> {
+  const source = env.ytdlp.cookiesFile;
+  if (!source) {
+    cookieFile = null;
+    return;
+  }
+
+  try {
+    await fs.access(source);
+  } catch {
+    cookieFile = null;
+    logger.warn(
+      `YTDLP_COOKIES_FILE is set to "${source}" but that file cannot be read — continuing without cookies.`,
+    );
+    return;
+  }
+
+  // Deliberately not inside env.tempDir: the cleanup sweep would delete it after the TTL.
+  const destination = path.join(os.tmpdir(), 'cliptube-yt-dlp-cookies.txt');
+
+  try {
+    await fs.copyFile(source, destination);
+    cookieFile = destination;
+    logger.info(`Using cookies from ${source} (working copy at ${destination})`);
+  } catch (error) {
+    cookieFile = source;
+    logger.warn(
+      `Could not copy the cookie file to a writable location; using ${source} directly.`,
+      error,
+    );
+  }
+}
+
+/**
+ * Args shared by every yt-dlp invocation, including the optional cookie/proxy/extractor
+ * settings that get a cloud-hosted instance past YouTube's bot checks. Each is omitted
+ * entirely when its variable is unset, so a blank value is always safe.
+ */
+function baseArgs(): string[] {
+  const args = ['--no-playlist', '--no-warnings', '--ignore-config'];
+
+  if (cookieFile) args.push('--cookies', cookieFile);
+  if (env.ytdlp.proxy) args.push('--proxy', env.ytdlp.proxy);
+  if (env.ytdlp.extractorArgs) args.push('--extractor-args', env.ytdlp.extractorArgs);
+
+  return args;
+}
+
+/** True when yt-dlp's helper ffmpeg died on a signal (code -11 is SIGSEGV). */
+export function isFfmpegCrash(error: unknown): boolean {
+  return (
+    error instanceof ProcessError && /ffmpeg exited with code -\d+/i.test(error.stderr)
+  );
+}
 
 /** Turns yt-dlp's stderr into something worth showing a user. */
 function describeFailure(error: unknown): string {
@@ -50,13 +117,21 @@ function describeFailure(error: unknown): string {
   if (stderr.includes('private video')) return 'That video is private.';
   if (stderr.includes('video unavailable')) return 'That video is unavailable.';
   if (stderr.includes('members-only')) return 'That video is members-only.';
-  if (stderr.includes('age')) return 'That video is age-restricted and cannot be fetched.';
-  if (stderr.includes('sign in to confirm')) {
-    return 'YouTube asked for sign-in verification for this video.';
+  if (stderr.includes('age-restricted') || stderr.includes('confirm your age')) {
+    return 'That video is age-restricted and cannot be fetched without sign-in.';
+  }
+  if (stderr.includes('sign in to confirm') || stderr.includes('not a bot')) {
+    return (
+      'YouTube blocked this request as automated. This usually happens on cloud/server ' +
+      'IPs — set YTDLP_COOKIES_FILE or YTDLP_PROXY on the server to get past it.'
+    );
   }
   if (stderr.includes('is not a valid url')) return 'yt-dlp rejected that URL.';
   if (stderr.includes('requested format is not available')) {
     return 'That format is no longer available — refresh the format list and try again.';
+  }
+  if (isFfmpegCrash(error)) {
+    return 'ffmpeg crashed while cutting this clip. Try a lower quality or a shorter range.';
   }
 
   const firstError = error.stderr
@@ -70,7 +145,7 @@ function describeFailure(error: unknown): string {
 /** Fetches the full metadata blob (`yt-dlp -J`) for a single video. */
 export async function fetchVideoInfo(url: string): Promise<RawVideoInfo> {
   try {
-    const { stdout } = await run(YTDLP_PATH, [...BASE_ARGS, '--no-progress', '-J', url], {
+    const { stdout } = await run(YTDLP_PATH, [...baseArgs(), '--no-progress', '-J', url], {
       timeoutMs: 90_000,
     });
     const parsed = JSON.parse(stdout) as RawVideoInfo;
@@ -103,17 +178,11 @@ export interface DownloadSectionOptions {
 
 const PROGRESS_PATTERN = /^progress:\s*(\d+(?:\.\d+)?)$/;
 
-/**
- * Downloads just the requested section at the requested format.
- *
- * `--force-keyframes-at-cuts` makes yt-dlp re-encode around the cut points so the clip
- * starts exactly where the user asked instead of snapping to the previous keyframe.
- */
-export async function downloadSection(options: DownloadSectionOptions): Promise<void> {
+function sectionArgs(options: DownloadSectionOptions, forceKeyframes: boolean): string[] {
   const section = `*${options.startSeconds.toFixed(3)}-${options.endSeconds.toFixed(3)}`;
 
   const args = [
-    ...BASE_ARGS,
+    ...baseArgs(),
     // yt-dlp needs ffmpeg for section cuts and merging; point it at the bundled one.
     '--ffmpeg-location',
     FFMPEG_PATH,
@@ -121,9 +190,9 @@ export async function downloadSection(options: DownloadSectionOptions): Promise<
     options.formatSelector,
     '--download-sections',
     section,
-    '--force-keyframes-at-cuts',
     '--no-part',
     '--no-mtime',
+    '--force-overwrites',
     '--newline',
     // Machine-readable progress on stdout instead of the interactive progress bar.
     '--progress-template',
@@ -132,24 +201,73 @@ export async function downloadSection(options: DownloadSectionOptions): Promise<
     options.outputTemplate,
   ];
 
+  if (forceKeyframes) {
+    args.push('--force-keyframes-at-cuts');
+  }
+
   if (options.mergeContainer) {
     args.push('--merge-output-format', options.mergeContainer);
   }
 
   args.push(options.url);
+  return args;
+}
+
+/** Clears leftovers so a retry can't resume from, or pick up, a half-written file. */
+async function clearWorkDir(outputTemplate: string): Promise<void> {
+  const directory = path.dirname(outputTemplate);
+  await fs.rm(directory, { recursive: true, force: true });
+  await fs.mkdir(directory, { recursive: true });
+}
+
+async function attemptSection(
+  options: DownloadSectionOptions,
+  forceKeyframes: boolean,
+): Promise<void> {
+  await clearWorkDir(options.outputTemplate);
+
+  await run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
+    timeoutMs: options.timeoutMs ?? 20 * 60_000,
+    onStdoutLine: (line) => {
+      const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
+      if (match && options.onProgress) {
+        options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
+      }
+    },
+  });
+}
+
+/**
+ * Downloads just the requested section at the requested format.
+ *
+ * The first attempt passes `--force-keyframes-at-cuts`, which re-encodes around the cut
+ * points so the clip starts exactly where the user asked instead of snapping back to the
+ * previous keyframe. That re-encode is also the fragile part: on some inputs the helper
+ * ffmpeg dies with SIGSEGV (`code -11`). When that happens we retry with a plain
+ * keyframe-aligned cut, which needs no re-encode — the start may land up to a keyframe
+ * early, but the download succeeds instead of failing outright.
+ */
+export async function downloadSection(options: DownloadSectionOptions): Promise<void> {
+  if (env.ytdlp.forceKeyframes) {
+    try {
+      await attemptSection(options, true);
+      return;
+    } catch (error) {
+      if (!isFfmpegCrash(error)) {
+        logger.error('yt-dlp download failed', error);
+        throw upstreamFailure(describeFailure(error));
+      }
+
+      logger.warn(
+        'ffmpeg crashed during the keyframe-forced cut — retrying with a keyframe-aligned cut.',
+      );
+    }
+  }
 
   try {
-    await run(YTDLP_PATH, args, {
-      timeoutMs: options.timeoutMs ?? 20 * 60_000,
-      onStdoutLine: (line) => {
-        const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
-        if (match && options.onProgress) {
-          options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
-        }
-      },
-    });
+    await attemptSection(options, false);
   } catch (error) {
-    logger.error('yt-dlp download failed', error);
+    logger.error('yt-dlp download failed after keyframe-aligned retry', error);
     throw upstreamFailure(describeFailure(error));
   }
 }
