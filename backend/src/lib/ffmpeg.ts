@@ -46,6 +46,11 @@ export interface RemuxOptions {
   input: string;
   output: string;
   kind: 'video' | 'audio';
+  /**
+   * Seek offset into the input. Set when the input is the whole video rather than an
+   * already-cut section, so this pass does the trimming.
+   */
+  startSeconds?: number | null;
   /** Hard-caps the output length when yt-dlp's cut overshot the requested range. */
   limitSeconds?: number | null;
   onProgress?: (percent: number) => void;
@@ -66,8 +71,17 @@ export async function remux(options: RemuxOptions): Promise<void> {
     outputOptions.push('-t', options.limitSeconds.toFixed(3));
   }
 
+  // `-nostdin` stops ffmpeg reading the parent's stdin, where an overwrite prompt would
+  // otherwise block forever. Seeking before `-i` is the fast path: ffmpeg jumps to the
+  // nearest preceding keyframe instead of decoding from the start of the file.
+  const inputOptions = ['-nostdin'];
+  if (options.startSeconds && options.startSeconds > 0) {
+    inputOptions.push('-ss', options.startSeconds.toFixed(3));
+  }
+
   await new Promise<void>((resolve, reject) => {
     const command = Ffmpeg(options.input)
+      .inputOptions(inputOptions)
       .outputOptions(outputOptions)
       .output(options.output);
 

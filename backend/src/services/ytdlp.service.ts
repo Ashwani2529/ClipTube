@@ -107,6 +107,18 @@ export function isFfmpegCrash(error: unknown): boolean {
   );
 }
 
+/**
+ * Raised when the section download can't be completed because the ffmpeg that yt-dlp
+ * uses to fetch it crashed. Signals the caller to fall back to fetching the whole format
+ * and trimming it locally, which keeps ffmpeg away from the network stream.
+ */
+export class SectionDownloadUnavailable extends Error {
+  constructor(cause: unknown) {
+    super('The section download failed because ffmpeg crashed.', { cause });
+    this.name = 'SectionDownloadUnavailable';
+  }
+}
+
 /** Turns yt-dlp's stderr into something worth showing a user. */
 function describeFailure(error: unknown): string {
   if (!(error instanceof ProcessError)) {
@@ -246,7 +258,11 @@ async function bytesOnDisk(directory: string): Promise<number> {
  * actually drives the progress bar for section downloads, since yt-dlp's own progress
  * hook stays silent while ffmpeg does the fetching.
  */
-function trackDiskProgress(options: DownloadSectionOptions): () => void {
+function trackDiskProgress(options: {
+  outputTemplate: string;
+  expectedBytes?: number | null;
+  onProgress?: (percent: number) => void;
+}): () => void {
   const expected = options.expectedBytes ?? 0;
   if (expected <= 0 || !options.onProgress) return () => undefined;
 
@@ -288,12 +304,15 @@ async function attemptSection(
 /**
  * Downloads just the requested section at the requested format.
  *
- * The first attempt passes `--force-keyframes-at-cuts`, which re-encodes around the cut
- * points so the clip starts exactly where the user asked instead of snapping back to the
- * previous keyframe. That re-encode is also the fragile part: on some inputs the helper
- * ffmpeg dies with SIGSEGV (`code -11`). When that happens we retry with a plain
- * keyframe-aligned cut, which needs no re-encode — the start may land up to a keyframe
- * early, but the download succeeds instead of failing outright.
+ * `--download-sections` always routes the fetch through ffmpeg, because seeking into a
+ * remote stream is ffmpeg's job — so ffmpeg runs on the network stream here regardless of
+ * `--force-keyframes-at-cuts`. `--force-keyframes-at-cuts` additionally re-encodes around
+ * the cut points for an exact start.
+ *
+ * If that ffmpeg dies on a signal (`code -11`), we first retry without the re-encode, and
+ * if it still crashes we give up on this route entirely by throwing
+ * `SectionDownloadUnavailable` — the caller then fetches the whole format with yt-dlp's
+ * own HTTP downloader and trims it locally, which never hands ffmpeg a URL.
  */
 export async function downloadSection(options: DownloadSectionOptions): Promise<void> {
   if (env.ytdlp.forceKeyframes) {
@@ -315,7 +334,76 @@ export async function downloadSection(options: DownloadSectionOptions): Promise<
   try {
     await attemptSection(options, false);
   } catch (error) {
-    logger.error('yt-dlp download failed after keyframe-aligned retry', error);
+    if (isFfmpegCrash(error)) {
+      logger.warn(
+        'ffmpeg crashed fetching the section — falling back to a full-format download.',
+      );
+      throw new SectionDownloadUnavailable(error);
+    }
+
+    logger.error('yt-dlp download failed', error);
     throw upstreamFailure(describeFailure(error));
+  }
+}
+
+export interface DownloadFormatOptions {
+  url: string;
+  formatSelector: string;
+  outputTemplate: string;
+  mergeContainer?: 'mp4' | null;
+  onProgress?: (percent: number) => void;
+  expectedBytes?: number | null;
+  timeoutMs?: number;
+}
+
+/**
+ * Downloads a complete format with yt-dlp's native HTTP downloader — no
+ * `--download-sections`, so ffmpeg is only involved in merging local files. Slower than a
+ * section download because the whole video comes down, but it is the route that works
+ * when ffmpeg cannot read the remote stream. The caller trims the result.
+ */
+export async function downloadFullFormat(options: DownloadFormatOptions): Promise<void> {
+  const args = [
+    ...baseArgs(),
+    '--ffmpeg-location',
+    FFMPEG_PATH,
+    '-f',
+    options.formatSelector,
+    '--no-part',
+    '--no-mtime',
+    '--force-overwrites',
+    '--newline',
+    '--progress-template',
+    'progress:%(progress._percent_str)s',
+    '-o',
+    options.outputTemplate,
+  ];
+
+  if (options.mergeContainer) {
+    args.push('--merge-output-format', options.mergeContainer);
+  }
+
+  args.push(options.url);
+
+  await clearWorkDir(options.outputTemplate);
+  // The native downloader does report percentages, but disk sampling also covers the
+  // merge step, so both feed the same progress callback.
+  const stopTracking = trackDiskProgress(options);
+
+  try {
+    await run(YTDLP_PATH, args, {
+      timeoutMs: options.timeoutMs ?? 25 * 60_000,
+      onStdoutLine: (line) => {
+        const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
+        if (match && options.onProgress) {
+          options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
+        }
+      },
+    });
+  } catch (error) {
+    logger.error('yt-dlp full-format download failed', error);
+    throw upstreamFailure(describeFailure(error));
+  } finally {
+    stopTracking();
   }
 }

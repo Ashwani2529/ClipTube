@@ -7,7 +7,13 @@ import { slugify } from '../lib/slugify';
 import { probe, remux } from '../lib/ffmpeg';
 import { HttpError, badRequest, notFound } from '../lib/errors';
 import { Job, type ClipType, type JobDocument } from '../models/Job';
-import { downloadSection, type RawFormat, type RawVideoInfo } from './ytdlp.service';
+import {
+  SectionDownloadUnavailable,
+  downloadFullFormat,
+  downloadSection,
+  type RawFormat,
+  type RawVideoInfo,
+} from './ytdlp.service';
 import { findFormat, getVideoInfo, mergeAudioSize, toMeta } from './formats.service';
 
 /** Sub-directory per job keeps the human-readable filename collision-free. */
@@ -198,22 +204,47 @@ export async function processJob(jobId: string): Promise<void> {
     const targetExt =
       type === 'video' ? 'mp4' : containerForAudioCodec(format.acodec, format.ext ?? 'm4a');
 
-    await downloadSection({
-      url: job.url,
-      formatSelector: buildFormatSelector(type, job.formatId, hasAudio),
-      startSeconds: job.start,
-      endSeconds: job.end,
-      outputTemplate: path.join(directory, `${SOURCE_STEM}.%(ext)s`),
-      mergeContainer: type === 'video' ? 'mp4' : null,
-      expectedBytes: estimateSectionBytes(
-        format,
-        info,
-        job.end - job.start,
-        type === 'video' && !hasAudio,
-      ),
-      onProgress: (percent) =>
-        reportProgress((percent / 100) * DOWNLOAD_PROGRESS_CEILING),
-    });
+    const mergesAudio = type === 'video' && !hasAudio;
+    const formatSelector = buildFormatSelector(type, job.formatId, hasAudio);
+    const outputTemplate = path.join(directory, `${SOURCE_STEM}.%(ext)s`);
+    const mergeContainer = type === 'video' ? ('mp4' as const) : null;
+    const onProgress = (percent: number) =>
+      reportProgress((percent / 100) * DOWNLOAD_PROGRESS_CEILING);
+
+    /**
+     * True when the downloaded file is the whole video and this pass has to do the
+     * trimming, rather than yt-dlp having already cut the section.
+     */
+    let trimLocally = false;
+
+    try {
+      await downloadSection({
+        url: job.url,
+        formatSelector,
+        startSeconds: job.start,
+        endSeconds: job.end,
+        outputTemplate,
+        mergeContainer,
+        expectedBytes: estimateSectionBytes(format, info, job.end - job.start, mergesAudio),
+        onProgress,
+      });
+    } catch (error) {
+      if (!(error instanceof SectionDownloadUnavailable)) throw error;
+
+      // ffmpeg can't read the remote stream on this host. Pull the whole format down with
+      // yt-dlp's own downloader instead and cut it from disk below.
+      logger.warn(`Job ${jobId}: falling back to a full-format download.`);
+      trimLocally = true;
+
+      await downloadFullFormat({
+        url: job.url,
+        formatSelector,
+        outputTemplate,
+        mergeContainer,
+        expectedBytes: estimateSectionBytes(format, info, info.duration ?? 0, mergesAudio),
+        onProgress,
+      });
+    }
 
     const sourcePath = await findDownloadedFile(directory);
     if (!sourcePath) {
@@ -242,7 +273,9 @@ export async function processJob(jobId: string): Promise<void> {
       input: sourcePath,
       output: finalPath,
       kind: type,
-      limitSeconds: overshoot ? requestedDuration : null,
+      // On the fallback route the input is the whole video, so this pass does the cut.
+      startSeconds: trimLocally ? job.start : null,
+      limitSeconds: trimLocally || overshoot ? requestedDuration : null,
       onProgress: (percent) =>
         reportProgress(
           DOWNLOAD_PROGRESS_CEILING + (percent / 100) * (100 - DOWNLOAD_PROGRESS_CEILING),
