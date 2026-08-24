@@ -3,10 +3,11 @@ import type { Server } from 'http';
 import { createApp } from './app';
 import { env } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/db';
-import { BINARY_PATHS } from './lib/binaries';
+import { BINARY_PATHS, stageFfmpegDirectory } from './lib/binaries';
 import { logger } from './lib/logger';
 import { startCleanupSchedule, stopCleanupSchedule } from './services/cleanup.service';
 import { prepareCookieFile } from './services/ytdlp.service';
+import { startProxyPool } from './services/proxy.service';
 
 async function bootstrap(): Promise<void> {
   logger.info('Starting ClipTube API…');
@@ -18,7 +19,10 @@ async function bootstrap(): Promise<void> {
   await fs.mkdir(env.tempDir, { recursive: true });
   logger.info(`Temp directory: ${env.tempDir}`);
 
+  // yt-dlp needs ffmpeg and ffprobe side by side; see stageFfmpegDirectory().
+  await stageFfmpegDirectory();
   await prepareCookieFile();
+  startProxyPool();
 
   await connectDatabase();
   await startCleanupSchedule();

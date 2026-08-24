@@ -2,10 +2,11 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { ProcessError, run } from '../lib/exec';
-import { FFMPEG_PATH, YTDLP_PATH } from '../lib/binaries';
+import { YTDLP_PATH, ffmpegLocation } from '../lib/binaries';
 import { upstreamFailure } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
+import { activeProxy, rotateProxy } from './proxy.service';
 
 /** The subset of yt-dlp's `-J` output this app relies on. */
 export interface RawFormat {
@@ -94,10 +95,49 @@ function baseArgs(): string[] {
   const args = ['--no-playlist', '--no-warnings', '--ignore-config'];
 
   if (cookieFile) args.push('--cookies', cookieFile);
-  if (env.ytdlp.proxy) args.push('--proxy', env.ytdlp.proxy);
+
+  // Read per call, not cached: rotation swaps this out between retries.
+  const proxy = activeProxy();
+  if (proxy) args.push('--proxy', proxy);
+
   if (env.ytdlp.extractorArgs) args.push('--extractor-args', env.ytdlp.extractorArgs);
 
+  if (env.ytdlp.sleepInterval > 0) {
+    args.push('--sleep-interval', String(env.ytdlp.sleepInterval));
+    if (env.ytdlp.maxSleepInterval > env.ytdlp.sleepInterval) {
+      args.push('--max-sleep-interval', String(env.ytdlp.maxSleepInterval));
+    }
+  }
+
   return args;
+}
+
+/** True when YouTube refused the request rather than the download itself failing. */
+function isBlockedByYoutube(error: unknown): boolean {
+  if (!(error instanceof ProcessError)) return false;
+  const stderr = error.stderr.toLowerCase();
+  return (
+    stderr.includes('sign in to confirm') ||
+    stderr.includes('not a bot') ||
+    stderr.includes('http error 403') ||
+    stderr.includes('unable to connect to proxy') ||
+    (stderr.includes('proxy') && stderr.includes('timed out'))
+  );
+}
+
+/**
+ * Retries an operation across the proxy pool while YouTube keeps refusing us, the same
+ * loop yt-dlp-proxy runs: try, detect the block in the output, switch proxy, try again.
+ * Non-block failures propagate immediately.
+ */
+async function withProxyRotation<T>(operation: () => Promise<T>): Promise<T> {
+  for (;;) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isBlockedByYoutube(error) || !rotateProxy()) throw error;
+    }
+  }
 }
 
 /** True when yt-dlp's helper ffmpeg died on a signal (code -11 is SIGSEGV). */
@@ -157,9 +197,9 @@ function describeFailure(error: unknown): string {
 /** Fetches the full metadata blob (`yt-dlp -J`) for a single video. */
 export async function fetchVideoInfo(url: string): Promise<RawVideoInfo> {
   try {
-    const { stdout } = await run(YTDLP_PATH, [...baseArgs(), '--no-progress', '-J', url], {
-      timeoutMs: 90_000,
-    });
+    const { stdout } = await withProxyRotation(() =>
+      run(YTDLP_PATH, [...baseArgs(), '--no-progress', '-J', url], { timeoutMs: 90_000 }),
+    );
     const parsed = JSON.parse(stdout) as RawVideoInfo;
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.formats)) {
       throw upstreamFailure('yt-dlp returned no formats for that video.');
@@ -202,7 +242,7 @@ function sectionArgs(options: DownloadSectionOptions, forceKeyframes: boolean): 
     ...baseArgs(),
     // yt-dlp needs ffmpeg for section cuts and merging; point it at the bundled one.
     '--ffmpeg-location',
-    FFMPEG_PATH,
+    ffmpegLocation(),
     '-f',
     options.formatSelector,
     '--download-sections',
@@ -283,18 +323,22 @@ async function attemptSection(
   options: DownloadSectionOptions,
   forceKeyframes: boolean,
 ): Promise<void> {
-  await clearWorkDir(options.outputTemplate);
   const stopTracking = trackDiskProgress(options);
 
   try {
-    await run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
-      timeoutMs: options.timeoutMs ?? 20 * 60_000,
-      onStdoutLine: (line) => {
-        const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
-        if (match && options.onProgress) {
-          options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
-        }
-      },
+    await withProxyRotation(async () => {
+      // Each attempt starts from a clean directory so a blocked run leaves nothing behind.
+      await clearWorkDir(options.outputTemplate);
+
+      return run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
+        timeoutMs: options.timeoutMs ?? 20 * 60_000,
+        onStdoutLine: (line) => {
+          const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
+          if (match && options.onProgress) {
+            options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
+          }
+        },
+      });
     });
   } finally {
     stopTracking();
@@ -363,42 +407,49 @@ export interface DownloadFormatOptions {
  * when ffmpeg cannot read the remote stream. The caller trims the result.
  */
 export async function downloadFullFormat(options: DownloadFormatOptions): Promise<void> {
-  const args = [
-    ...baseArgs(),
-    '--ffmpeg-location',
-    FFMPEG_PATH,
-    '-f',
-    options.formatSelector,
-    '--no-part',
-    '--no-mtime',
-    '--force-overwrites',
-    '--newline',
-    '--progress-template',
-    'progress:%(progress._percent_str)s',
-    '-o',
-    options.outputTemplate,
-  ];
+  // Rebuilt per attempt so a rotated proxy is picked up on retry.
+  const buildArgs = (): string[] => {
+    const args = [
+      ...baseArgs(),
+      '--ffmpeg-location',
+      ffmpegLocation(),
+      '-f',
+      options.formatSelector,
+      '--no-part',
+      '--no-mtime',
+      '--force-overwrites',
+      '--newline',
+      '--progress-template',
+      'progress:%(progress._percent_str)s',
+      '-o',
+      options.outputTemplate,
+    ];
 
-  if (options.mergeContainer) {
-    args.push('--merge-output-format', options.mergeContainer);
-  }
+    if (options.mergeContainer) {
+      args.push('--merge-output-format', options.mergeContainer);
+    }
 
-  args.push(options.url);
+    args.push(options.url);
+    return args;
+  };
 
-  await clearWorkDir(options.outputTemplate);
   // The native downloader does report percentages, but disk sampling also covers the
   // merge step, so both feed the same progress callback.
   const stopTracking = trackDiskProgress(options);
 
   try {
-    await run(YTDLP_PATH, args, {
-      timeoutMs: options.timeoutMs ?? 25 * 60_000,
-      onStdoutLine: (line) => {
-        const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
-        if (match && options.onProgress) {
-          options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
-        }
-      },
+    await withProxyRotation(async () => {
+      await clearWorkDir(options.outputTemplate);
+
+      return run(YTDLP_PATH, buildArgs(), {
+        timeoutMs: options.timeoutMs ?? 25 * 60_000,
+        onStdoutLine: (line) => {
+          const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
+          if (match && options.onProgress) {
+            options.onProgress(Math.min(100, Number.parseFloat(match[1] as string)));
+          }
+        },
+      });
     });
   } catch (error) {
     logger.error('yt-dlp full-format download failed', error);
