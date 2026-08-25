@@ -9,8 +9,31 @@ import { startCleanupSchedule, stopCleanupSchedule } from './services/cleanup.se
 import { prepareCookieFile } from './services/ytdlp.service';
 import { startProxyPool } from './services/proxy.service';
 
+/**
+ * Prints when this file was compiled, plus the settings that actually shape the yt-dlp
+ * command. A stale `dist/` is otherwise invisible in the logs — the process starts
+ * cleanly and only the spawn arguments give it away.
+ */
+async function logBuildIdentity(): Promise<void> {
+  const compiledAt = await fs
+    .stat(__filename)
+    .then((stat) => stat.mtime.toISOString())
+    .catch(() => 'unknown');
+
+  logger.info(`build: ${__filename} compiled ${compiledAt}`);
+  logger.info(
+    `effective yt-dlp settings: forceKeyframes=${env.ytdlp.forceKeyframes} ` +
+      `cookies=${env.ytdlp.cookiesFile ? 'set' : 'none'} ` +
+      `proxy=${env.ytdlp.proxy ? 'fixed' : env.ytdlp.autoProxy ? 'auto' : 'none'} ` +
+      `extractorArgs=${env.ytdlp.extractorArgs || '(rotating)'} ` +
+      `playerClients=[${env.ytdlp.playerClients.join(',')}]`,
+  );
+}
+
 async function bootstrap(): Promise<void> {
   logger.info('Starting ClipTube API…');
+
+  await logBuildIdentity();
 
   Object.entries(BINARY_PATHS).forEach(([name, binaryPath]) => {
     logger.info(`${name}: ${binaryPath}`);

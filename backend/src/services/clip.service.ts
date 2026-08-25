@@ -210,10 +210,20 @@ export async function processJob(jobId: string): Promise<void> {
   const directory = jobDirectory(jobId);
   const reportProgress = progressWriter(jobId);
 
+  /** Numbered stage log, so a failure report shows exactly how far the job got. */
+  const short = jobId.slice(0, 8);
+  let stageNumber = 0;
+  const stage = (message: string) => {
+    stageNumber += 1;
+    logger.info(`[job ${short}] step ${stageNumber}/6 — ${message}`);
+  };
+
   try {
+    stage(`preparing ${directory}`);
     await fs.mkdir(directory, { recursive: true });
     await Job.updateOne({ jobId }, { $set: { status: 'downloading', progress: 0 } });
 
+    stage(`resolving metadata for ${job.videoId}`);
     const info = await getVideoInfo(job.videoId, job.url);
     const format = findFormat(info, job.formatId);
     if (!format) {
@@ -243,6 +253,17 @@ export async function processJob(jobId: string): Promise<void> {
      */
     let trimLocally = false;
 
+    stage(
+      `chosen format ${job.formatId} (${format.height ? `${format.height}p` : 'audio'}, ` +
+        `${format.ext ?? '?'}, vcodec=${format.vcodec ?? 'none'}, acodec=${format.acodec ?? 'none'}) ` +
+        `→ selector "${formatSelector}", target .${targetExt}, merges audio=${mergesAudio}`,
+    );
+
+    stage(
+      `section download ${job.start.toFixed(3)}–${job.end.toFixed(3)}s ` +
+        `(forceKeyframes=${env.ytdlp.forceKeyframes})`,
+    );
+
     try {
       await downloadSection({
         url: job.url,
@@ -259,7 +280,10 @@ export async function processJob(jobId: string): Promise<void> {
 
       // ffmpeg can't read the remote stream on this host. Pull the whole format down with
       // yt-dlp's own downloader instead and cut it from disk below.
-      logger.warn(`Job ${jobId}: falling back to a full-format download.`);
+      logger.warn(
+        `[job ${short}] ffmpeg could not fetch the section — falling back to a ` +
+          `full-format download plus a local trim.`,
+      );
       trimLocally = true;
 
       await downloadFullFormat({
@@ -274,8 +298,17 @@ export async function processJob(jobId: string): Promise<void> {
 
     const sourcePath = await findDownloadedFile(directory);
     if (!sourcePath) {
-      throw new Error('yt-dlp finished but produced no file.');
+      const listing = await fs.readdir(directory).catch(() => []);
+      throw new Error(
+        `yt-dlp finished but produced no file. Directory contains: ${listing.join(', ') || '(empty)'}`,
+      );
     }
+
+    const sourceStat = await fs.stat(sourcePath);
+    stage(
+      `downloaded ${path.basename(sourcePath)} (${(sourceStat.size / 1_048_576).toFixed(1)} MB)` +
+        `${trimLocally ? ' — whole video, trimming locally' : ''}`,
+    );
 
     await Job.updateOne(
       { jobId },
@@ -284,7 +317,7 @@ export async function processJob(jobId: string): Promise<void> {
 
     const requestedDuration = job.end - job.start;
     const probed = await probe(sourcePath).catch((error: unknown) => {
-      logger.warn(`ffprobe failed for job ${jobId}`, error);
+      logger.warn(`[job ${short}] ffprobe failed`, error);
       return null;
     });
 
@@ -292,8 +325,15 @@ export async function processJob(jobId: string): Promise<void> {
       probed?.durationSeconds != null &&
       probed.durationSeconds - requestedDuration > DURATION_TOLERANCE_SECONDS;
 
+    stage(
+      `probed duration ${probed?.durationSeconds?.toFixed(2) ?? 'unknown'}s ` +
+        `(requested ${requestedDuration.toFixed(2)}s, overshoot=${overshoot})`,
+    );
+
     const fileName = `${slugify(job.title || 'clip')}-clip.${targetExt}`;
     const finalPath = path.join(directory, fileName);
+
+    stage(`remuxing into ${fileName}`);
 
     await remux({
       input: sourcePath,
@@ -326,14 +366,16 @@ export async function processJob(jobId: string): Promise<void> {
       },
     );
 
-    logger.info(`Job ${jobId} ready — ${fileName} (${stat.size} bytes)`);
+    logger.info(
+      `[job ${short}] done — ${fileName} (${(stat.size / 1_048_576).toFixed(1)} MB)`,
+    );
   } catch (error) {
     const message =
       error instanceof HttpError || error instanceof Error
         ? error.message
         : 'The clip could not be created.';
 
-    logger.error(`Job ${jobId} failed`, error);
+    logger.error(`[job ${short}] failed at step ${stageNumber}/6: ${message}`, error);
 
     await Job.updateOne(
       { jobId },

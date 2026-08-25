@@ -468,6 +468,11 @@ async function attemptSection(
   options: DownloadSectionOptions,
   forceKeyframes: boolean,
 ): Promise<void> {
+  logger.info(
+    `section download attempt: forceKeyframes=${forceKeyframes}, ` +
+      `ffmpeg-location=${ffmpegLocation()}, expectedBytes=${options.expectedBytes ?? 'unknown'}`,
+  );
+
   const stopTracking = trackDiskProgress(options);
 
   try {
