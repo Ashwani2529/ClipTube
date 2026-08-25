@@ -52,10 +52,20 @@ export const env = {
     /** Proxy URL, passed as `--proxy`. A residential proxy also clears bot checks. */
     proxy: str('YTDLP_PROXY', ''),
     /**
-     * Raw value for `--extractor-args`. Setting this takes full control and disables the
-     * player-client rotation below, so leave it blank unless you need a specific override.
+     * Raw value for `--extractor-args`. Setting this takes full control: it replaces the
+     * composed value entirely, so player-client rotation and the PO token are both
+     * skipped. Leave it blank unless you need an override the other settings can't express.
      */
     extractorArgs: str('YTDLP_EXTRACTOR_ARGS', ''),
+
+    /**
+     * Proof-of-origin token, sent as `po_token=<value>` alongside the player client.
+     * Datacenter IPs are the case PO tokens exist for — YouTube will serve a request that
+     * carries a valid one where it would otherwise demand sign-in. Format is
+     * `<client>.<context>+<token>`, e.g. `web.gvs+AbC…`. Tokens expire, so this is best
+     * pointed at something that refreshes them rather than pasted once by hand.
+     */
+    poToken: str('YTDLP_PO_TOKEN', ''),
 
     /**
      * YouTube player clients to try, in order. Each is passed as

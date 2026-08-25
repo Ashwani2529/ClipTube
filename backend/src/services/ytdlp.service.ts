@@ -178,13 +178,20 @@ function baseArgs(): string[] {
   if (proxy) args.push('--proxy', proxy);
 
   if (env.ytdlp.extractorArgs) {
+    // Explicit override: passed verbatim, so it must carry everything the user wants.
     args.push('--extractor-args', env.ytdlp.extractorArgs);
   } else {
+    // Composed into one `youtube:` value — a second --extractor-args for the same
+    // extractor would override the first rather than merge with it.
+    const parts: string[] = [];
+
     const client = env.ytdlp.playerClients[clientCursor];
-    // `default` means "let yt-dlp choose", so no flag at all.
-    if (client && client !== 'default') {
-      args.push('--extractor-args', `youtube:player_client=${client}`);
-    }
+    // `default` means "let yt-dlp choose", so it contributes nothing.
+    if (client && client !== 'default') parts.push(`player_client=${client}`);
+
+    if (env.ytdlp.poToken) parts.push(`po_token=${env.ytdlp.poToken}`);
+
+    if (parts.length > 0) args.push('--extractor-args', `youtube:${parts.join(';')}`);
   }
 
   if (env.ytdlp.sleepInterval > 0) {
@@ -318,9 +325,24 @@ function describeFailure(error: unknown): string {
     return 'That video is age-restricted and cannot be fetched without sign-in.';
   }
   if (stderr.includes('sign in to confirm') || stderr.includes('not a bot')) {
+    // Naming what is already configured keeps this from suggesting a fix that's in place.
+    const haveCookies = Boolean(cookieFile);
+    const haveProxy = Boolean(env.ytdlp.proxy) || env.ytdlp.autoProxy;
+
+    if (haveCookies && !haveProxy) {
+      return (
+        'YouTube blocked this request as automated even with cookies. Datacenter IPs are ' +
+        'blocked far more aggressively than home connections, and replaying a session ' +
+        'from a different network makes it worse rather than better. Route yt-dlp through ' +
+        'a residential proxy (YTDLP_PROXY), supply a PO token (YTDLP_PO_TOKEN), or run ' +
+        'the server from a residential connection.'
+      );
+    }
+
     return (
-      'YouTube blocked this request as automated. This usually happens on cloud/server ' +
-      'IPs — set YTDLP_COOKIES_FILE or YTDLP_PROXY on the server to get past it.'
+      'YouTube blocked this request as automated. This is normal on cloud/server IPs — ' +
+      `${haveCookies ? '' : 'set YTDLP_COOKIES_FILE, '}` +
+      'use a residential proxy (YTDLP_PROXY) or a PO token (YTDLP_PO_TOKEN).'
     );
   }
   if (stderr.includes('is not a valid url')) return 'yt-dlp rejected that URL.';
