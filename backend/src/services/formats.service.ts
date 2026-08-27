@@ -2,7 +2,6 @@ import { fetchVideoInfo, type RawFormat, type RawVideoInfo } from './ytdlp.servi
 import type {
   AudioFormatGroup,
   AudioTierOption,
-  FormatsResponse,
   VideoFormatOption,
   VideoMeta,
 } from '../types/api';
@@ -246,13 +245,15 @@ export function findFormat(info: RawVideoInfo, formatId: string): RawFormat | un
   return (info.formats ?? []).find((format) => format.format_id === formatId);
 }
 
-export async function getFormats(videoId: string, url: string): Promise<FormatsResponse> {
-  const info = await getVideoInfo(videoId, url);
-  const formats = info.formats ?? [];
-
-  return {
-    meta: toMeta(info, videoId, url),
-    video: buildVideoOptions(formats),
-    audio: buildAudioGroups(formats),
-  };
+/**
+ * The normalised picker lists. Shared by /api/formats and /api/resolve so both endpoints
+ * describe a video identically — the browser path and the server path must agree on format
+ * ids or a fallback mid-request would change the user's selection.
+ */
+export function buildFormatLists(formats: RawFormat[]): {
+  video: VideoFormatOption[];
+  audio: AudioFormatGroup[];
+} {
+  return { video: buildVideoOptions(formats), audio: buildAudioGroups(formats) };
 }
+

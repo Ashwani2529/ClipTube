@@ -54,6 +54,25 @@ export interface FormatsResponse {
   audio: AudioFormatGroup[]
 }
 
+/** A stream the browser may fetch directly from YouTube's CDN. */
+export interface DirectStreamInfo {
+  formatId: string
+  url: string
+  mimeType: string
+  contentLength: number | null
+  hasAudio: boolean
+  hasVideo: boolean
+  ext: string
+}
+
+export interface ResolveResponse {
+  videoId: string
+  meta: VideoMeta
+  video: VideoFormatOption[]
+  audio: AudioFormatGroup[]
+  direct: { streams: DirectStreamInfo[]; expiresAt: number | null } | null
+}
+
 export interface ClipResponse {
   jobId: string
   status: JobStatus

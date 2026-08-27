@@ -6,7 +6,8 @@ import { normalizeYoutubeUrl } from '../lib/youtube';
 import { parseTimeInput } from '../lib/time';
 import { CLIP_TYPES, Job, type ClipType } from '../models/Job';
 import { getDownloadCount, incrementDownloadCount } from '../models/Stats';
-import { getFormats } from '../services/formats.service';
+import { resolveWithServerSources } from '../services/sources';
+import * as telemetry from '../services/telemetry.service';
 import {
   createClipJob,
   getJob,
@@ -17,6 +18,7 @@ import type {
   ClipRequestBody,
   ClipResponse,
   JobStatusResponse,
+  ResolveResponse,
   StatsResponse,
 } from '../types/api';
 
@@ -47,16 +49,33 @@ function toStatusResponse(job: Awaited<ReturnType<typeof getJob>>): JobStatusRes
   };
 }
 
-/** POST /api/formats — normalised video/audio format lists for a YouTube URL. */
-apiRouter.post('/formats', async (req: Request, res: Response) => {
+/**
+ * POST /api/resolve — everything the browser needs to build the clip itself.
+ *
+ * Metadata and format lists, plus signed stream URLs in `direct` when YouTube provides
+ * them. This endpoint never transfers media: if the client can use the URLs, the bytes go
+ * straight from YouTube to the user and our egress carries nothing.
+ *
+ * The frontend only reaches this after its own browser-side resolution has failed, so a
+ * request arriving here already means the client path came up short.
+ */
+apiRouter.post('/resolve', async (req: Request, res: Response) => {
   const { url, videoId } = normalizeYoutubeUrl((req.body as { url?: unknown })?.url);
-  const formats = await getFormats(videoId, url);
+  const resolved = await resolveWithServerSources(videoId, url);
 
-  if (formats.video.length === 0 && formats.audio.length === 0) {
-    throw conflict('yt-dlp reported no downloadable formats for that video.');
+  if (resolved.video.length === 0 && resolved.audio.length === 0) {
+    throw conflict('No downloadable formats were found for that video.');
   }
 
-  res.json(formats);
+  const payload: ResolveResponse = {
+    videoId,
+    meta: resolved.meta,
+    video: resolved.video,
+    audio: resolved.audio,
+    direct: resolved.direct,
+  };
+
+  res.json(payload);
 });
 
 /** POST /api/clip — creates a job and starts the download in the background. */
@@ -174,4 +193,61 @@ apiRouter.get('/download/:jobId', async (req: Request, res: Response) => {
 apiRouter.get('/stats', async (_req: Request, res: Response) => {
   const payload: StatsResponse = { totalDownloads: await getDownloadCount() };
   res.json(payload);
+});
+
+const OUTCOME_VALUES = new Set(telemetry.OUTCOMES as readonly string[]);
+const TRISTATE = new Set(['success', 'failure', 'skipped']);
+const ACQUISITIONS = new Set(['capture', 'direct', 'server']);
+
+/** Bounded so a malformed or hostile body cannot distort the experiment's numbers. */
+function clampNumber(raw: unknown, max: number): number {
+  const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : 0;
+  return Math.min(Math.max(0, Math.round(value)), max);
+}
+
+function pick<T extends string>(raw: unknown, allowed: Set<string>, fallback: T): T {
+  return typeof raw === 'string' && allowed.has(raw) ? (raw as T) : fallback;
+}
+
+/**
+ * POST /api/telemetry — one record per finished clip attempt.
+ *
+ * Accepts only the enumerated operational fields below; anything else in the body is
+ * ignored. Counters live in memory and are never persisted, so this cannot accumulate into
+ * a history of what anyone clipped.
+ */
+apiRouter.post('/telemetry', (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  telemetry.record({
+    outcome: pick(body.outcome, OUTCOME_VALUES, 'failed'),
+    browserResolution: pick(body.browserResolution, TRISTATE, 'skipped'),
+    clientProcessing: pick(body.clientProcessing, TRISTATE, 'skipped'),
+    serverFallback: body.serverFallback === 'used' ? 'used' : 'not-used',
+    acquisition:
+      typeof body.acquisition === 'string' && ACQUISITIONS.has(body.acquisition)
+        ? (body.acquisition as 'capture' | 'direct' | 'server')
+        : null,
+    // Codes come from a fixed frontend vocabulary; truncated in case that ever drifts.
+    failureCode:
+      typeof body.failureCode === 'string' && body.failureCode !== ''
+        ? body.failureCode.slice(0, 48)
+        : null,
+    durationMs: clampNumber(body.durationMs, 6 * 60 * 60_000),
+    clipSeconds: clampNumber(body.clipSeconds, 24 * 60 * 60),
+    platform: typeof body.platform === 'string' ? body.platform : 'desktop',
+  });
+
+  // Nothing to say back; the client fires this and forgets it.
+  res.status(204).end();
+});
+
+/**
+ * GET /api/metrics — aggregated results of the browser-first experiment.
+ *
+ * `clientOnlySuccessRatePercent` is the headline figure: the share of completed clips where
+ * the backend made no YouTube request at all.
+ */
+apiRouter.get('/metrics', (_req: Request, res: Response) => {
+  res.json(telemetry.snapshot());
 });

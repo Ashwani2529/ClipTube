@@ -1,10 +1,20 @@
 import Ffmpeg from 'fluent-ffmpeg';
-import { FFMPEG_PATH, FFPROBE_PATH } from './binaries';
+import { ffmpegPath, ffprobePath } from './binaries';
 import { logger } from './logger';
 
-// The npm-provided paths are known at import time, so this is a one-off at module load.
-Ffmpeg.setFfmpegPath(FFMPEG_PATH);
-Ffmpeg.setFfprobePath(FFPROBE_PATH);
+let configured = false;
+
+/**
+ * Points fluent-ffmpeg at the npm-installed binaries on first use rather than at import.
+ * Doing it at import would resolve the server fallback's binaries just because this module
+ * was loaded, which is what previously stopped the process booting without them.
+ */
+function configureFfmpeg(): void {
+  if (configured) return;
+  Ffmpeg.setFfmpegPath(ffmpegPath());
+  Ffmpeg.setFfprobePath(ffprobePath());
+  configured = true;
+}
 
 export interface ProbeResult {
   durationSeconds: number | null;
@@ -15,6 +25,7 @@ export interface ProbeResult {
 }
 
 export async function probe(filePath: string): Promise<ProbeResult> {
+  configureFfmpeg();
   return new Promise((resolve, reject) => {
     Ffmpeg.ffprobe(filePath, (error, data) => {
       if (error) {
@@ -62,6 +73,7 @@ export interface RemuxOptions {
  * front for instant seeking, and trims any overshoot left by the keyframe-aligned cut.
  */
 export async function remux(options: RemuxOptions): Promise<void> {
+  configureFfmpeg();
   const outputOptions =
     options.kind === 'video'
       ? ['-map', '0:v:0?', '-map', '0:a:0?', '-c', 'copy', '-movflags', '+faststart']

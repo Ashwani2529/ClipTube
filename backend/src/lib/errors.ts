@@ -19,3 +19,6 @@ export const conflict = (message: string) => new HttpError(409, message);
 
 export const upstreamFailure = (message: string, details?: unknown) =>
   new HttpError(502, message, details);
+
+/** Used when the server-side fallback is not installed on this deployment. */
+export const unavailable = (message: string) => new HttpError(503, message);

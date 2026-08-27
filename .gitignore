@@ -6,3 +6,5 @@ temp/
 .DS_Store
 .vscode/*
 !.vscode/extensions.json
+.claude
+.claude/*

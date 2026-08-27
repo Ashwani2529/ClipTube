@@ -68,6 +68,14 @@ export const env = {
     poToken: str('YTDLP_PO_TOKEN', ''),
 
     /**
+     * Ceiling on how long the bot-check retry ladder may keep escalating. Each player
+     * client can cost 20s+, so an unbounded ladder outlives the HTTP client's timeout and
+     * the work is thrown away. Checked before each retry, so it never truncates a
+     * download that is already succeeding.
+     */
+    unblockDeadlineMs: int('YTDLP_UNBLOCK_DEADLINE_MS', 45_000),
+
+    /**
      * YouTube player clients to try, in order. Each is passed as
      * `--extractor-args youtube:player_client=<name>`, and a bot-checked request advances
      * to the next one. `default` is yt-dlp's own tuned set and is deliberately first —

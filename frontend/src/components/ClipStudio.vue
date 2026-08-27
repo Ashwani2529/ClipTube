@@ -4,9 +4,11 @@ import ClipDialog from './ClipDialog.vue'
 import RangeSlider from './RangeSlider.vue'
 import TimeField from './TimeField.vue'
 import YouTubePlayer from './YouTubePlayer.vue'
-import { describeError, fetchFormats } from '../lib/api'
 import { extractVideoId } from '../lib/youtube'
 import { formatDuration } from '../lib/time'
+import { createClipController } from '../services/clipController'
+import type { PlayerController } from '../services/media/types'
+import type { PlayerProbe } from '../services/youtube/browserSource'
 import type { ClipRange, FormatsResponse } from '../types'
 
 /** Matches the slider and the backend minimum clip length. */
@@ -26,11 +28,31 @@ const range = ref<ClipRange>({ start: 0, end: 0 })
 const playerError = ref<string | null>(null)
 
 const dialogOpen = ref(false)
-const formats = ref<FormatsResponse | null>(null)
-const formatsLoading = ref(false)
-const formatsError = ref<string | null>(null)
+const resolving = ref(false)
 
 const player = ref<InstanceType<typeof YouTubePlayer> | null>(null)
+
+/**
+ * The player is the browser's own connection to YouTube, so it is what the client-side
+ * extraction path reads duration and quality from. Both hooks resolve lazily through the
+ * ref because the controller outlives any single player instance.
+ */
+const probe: PlayerProbe = {
+  getDuration: () => player.value?.getDuration() ?? 0,
+  getAvailableQualityLevels: () => player.value?.getAvailableQualityLevels() ?? [],
+}
+
+const controller = createClipController({
+  probe,
+  controller: () => (player.value as PlayerController | null) ?? null,
+})
+
+/** Reshaped for the dialog, which only ever needed the picker lists. */
+const formats = computed<FormatsResponse | null>(() => {
+  const source = controller.source.value
+  if (!source) return null
+  return { meta: source.meta, video: source.video, audio: source.audio }
+})
 
 const canonicalUrl = computed(() =>
   videoId.value ? `https://www.youtube.com/watch?v=${videoId.value}` : '',
@@ -48,8 +70,7 @@ function loadUrl() {
 
   urlError.value = null
   playerError.value = null
-  formats.value = null
-  formatsError.value = null
+  controller.reset()
   duration.value = 0
   playhead.value = 0
   range.value = { start: 0, end: 0 }
@@ -95,20 +116,20 @@ function playSelection() {
   player.value?.play()
 }
 
+/**
+ * Resolution runs through the controller, which tries the browser first and only asks the
+ * backend if that comes up short. Either way the dialog just receives format lists.
+ */
 async function openClipDialog() {
   if (!ready.value) return
 
   dialogOpen.value = true
-  formatsLoading.value = true
-  formatsError.value = null
+  resolving.value = true
 
   try {
-    formats.value = await fetchFormats(canonicalUrl.value)
-  } catch (error) {
-    formats.value = null
-    formatsError.value = describeError(error, 'Could not read the formats for this video.')
+    await controller.resolve(canonicalUrl.value)
   } finally {
-    formatsLoading.value = false
+    resolving.value = false
   }
 }
 </script>
@@ -214,11 +235,12 @@ async function openClipDialog() {
 
     <ClipDialog
       :open="dialogOpen"
-      :loading="formatsLoading"
-      :error="formatsError"
+      :loading="resolving"
+      :error="formats ? null : controller.error.value"
       :formats="formats"
       :url="canonicalUrl"
       :range="range"
+      :controller="controller"
       @close="dialogOpen = false"
       @retry="openClipDialog"
       @started="emit('downloadStarted')"

@@ -151,7 +151,24 @@ onBeforeUnmount(() => {
   player = null
 })
 
-/** Parent-driven controls, used by the range slider and the timestamp fields. */
+/** YouTube quality ids by height, used to translate a requested resolution. */
+const QUALITY_BY_HEIGHT: ReadonlyArray<readonly [number, string]> = [
+  [4320, 'highres'],
+  [2160, 'hd2160'],
+  [1440, 'hd1440'],
+  [1080, 'hd1080'],
+  [720, 'hd720'],
+  [480, 'large'],
+  [360, 'medium'],
+  [240, 'small'],
+  [144, 'tiny'],
+]
+
+/**
+ * Parent-driven controls. Beyond the slider and timestamp fields, this is the full
+ * PlayerProbe + PlayerController surface the browser extraction path depends on — declaring
+ * it here keeps every YouTube-specific call inside this component.
+ */
 defineExpose({
   seek(seconds: number, allowSeekAhead = true) {
     player?.seekTo(Math.max(0, seconds), allowSeekAhead)
@@ -164,6 +181,41 @@ defineExpose({
   },
   currentTime(): number {
     return player?.getCurrentTime() ?? 0
+  },
+
+  // --- PlayerProbe ---
+  getDuration(): number {
+    return player?.getDuration() ?? 0
+  },
+  getAvailableQualityLevels(): string[] {
+    try {
+      return player?.getAvailableQualityLevels() ?? []
+    } catch {
+      // The method is missing on very old embeds; an empty ladder just means the browser
+      // source reports no formats and the server path takes over.
+      return []
+    }
+  },
+
+  // --- PlayerController ---
+  getCurrentTime(): number {
+    return player?.getCurrentTime() ?? 0
+  },
+  requestQuality(height: number) {
+    const match = QUALITY_BY_HEIGHT.find(([threshold]) => height >= threshold)
+    if (!match) return
+    try {
+      player?.setPlaybackQuality(match[1])
+    } catch {
+      // Advisory only — YouTube picks its own quality regardless.
+    }
+  },
+  setMuted(muted: boolean) {
+    if (muted) player?.mute()
+    else player?.unMute()
+  },
+  getContainer(): HTMLElement | null {
+    return host.value
   },
 })
 </script>

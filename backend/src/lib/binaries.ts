@@ -29,20 +29,65 @@ function resolveBinaryExport(moduleId: string): string {
   return candidate;
 }
 
+/**
+ * Resolution is deferred to first use rather than done at import.
+ *
+ * These binaries belong to the *server fallback* only. Resolving them at module load made
+ * the whole process refuse to boot when they were absent — including the telemetry, stats
+ * and resolve endpoints that need no binaries at all — which would have made the
+ * browser-first path depend on the very tooling it is meant to avoid. Nothing is executed
+ * to check them; this is still a plain module resolution, just a late one.
+ */
+function memoize(resolve: () => string): () => string {
+  let value: string | null = null;
+  return () => {
+    if (value === null) value = resolve();
+    return value;
+  };
+}
+
 /** Absolute path to the ffmpeg binary installed by `ffmpeg-static`. */
-export const FFMPEG_PATH: string = resolveBinaryExport('ffmpeg-static');
+export const ffmpegPath = memoize(() => resolveBinaryExport('ffmpeg-static'));
 
 /** Absolute path to the ffprobe binary installed by `ffprobe-static`. */
-export const FFPROBE_PATH: string = resolveBinaryExport('ffprobe-static');
+export const ffprobePath = memoize(() => resolveBinaryExport('ffprobe-static'));
 
 /** `youtube-dl-exec` installs yt-dlp into its own package folder. */
-export const YTDLP_PATH: string = path.join(
-  PROJECT_ROOT,
-  'node_modules',
-  'youtube-dl-exec',
-  'bin',
-  process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp',
+export const ytdlpPath = memoize(() =>
+  path.join(
+    PROJECT_ROOT,
+    'node_modules',
+    'youtube-dl-exec',
+    'bin',
+    process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp',
+  ),
 );
+
+let toolingAvailable: boolean | null = null;
+
+/**
+ * Whether the server-side fallback can run at all. Used to skip the yt-dlp strategy rather
+ * than fail a request with it, so a browser-only deployment is a supported configuration.
+ */
+export function isServerToolingAvailable(): boolean {
+  if (toolingAvailable !== null) return toolingAvailable;
+
+  try {
+    ffmpegPath();
+    ffprobePath();
+    ytdlpPath();
+    toolingAvailable = true;
+  } catch (error) {
+    logger.warn(
+      'Server-side extraction is disabled: its binaries are not installed. ' +
+        'The browser-first path is unaffected.',
+      error,
+    );
+    toolingAvailable = false;
+  }
+
+  return toolingAvailable;
+}
 
 const EXE_SUFFIX = process.platform === 'win32' ? '.exe' : '';
 
@@ -68,8 +113,8 @@ export async function stageFfmpegDirectory(): Promise<string> {
 
     await Promise.all(
       [
-        { source: FFMPEG_PATH, name: `ffmpeg${EXE_SUFFIX}` },
-        { source: FFPROBE_PATH, name: `ffprobe${EXE_SUFFIX}` },
+        { source: ffmpegPath(), name: `ffmpeg${EXE_SUFFIX}` },
+        { source: ffprobePath(), name: `ffprobe${EXE_SUFFIX}` },
       ].map(async ({ source, name }) => {
         const target = path.join(directory, name);
 
@@ -92,7 +137,7 @@ export async function stageFfmpegDirectory(): Promise<string> {
     ffmpegDirectory = directory;
     logger.info(`ffmpeg + ffprobe staged for yt-dlp in ${directory}`);
   } catch (error) {
-    ffmpegDirectory = path.dirname(FFMPEG_PATH);
+    ffmpegDirectory = path.dirname(ffmpegPath());
     logger.warn(
       `Could not stage ffmpeg and ffprobe together; yt-dlp will only see ffmpeg.`,
       error,
@@ -104,11 +149,10 @@ export async function stageFfmpegDirectory(): Promise<string> {
 
 /** The staged directory, or the ffmpeg binary itself before staging has run. */
 export function ffmpegLocation(): string {
-  return ffmpegDirectory ?? FFMPEG_PATH;
+  return ffmpegDirectory ?? ffmpegPath();
 }
 
-export const BINARY_PATHS: Readonly<Record<'yt-dlp' | 'ffmpeg' | 'ffprobe', string>> = {
-  'yt-dlp': YTDLP_PATH,
-  ffmpeg: FFMPEG_PATH,
-  ffprobe: FFPROBE_PATH,
-};
+/** Resolved lazily so a missing binary cannot prevent startup. */
+export function binaryPaths(): Readonly<Record<'yt-dlp' | 'ffmpeg' | 'ffprobe', string>> {
+  return { 'yt-dlp': ytdlpPath(), ffmpeg: ffmpegPath(), ffprobe: ffprobePath() };
+}

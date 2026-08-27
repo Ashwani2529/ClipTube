@@ -1,8 +1,9 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { ProcessError, run } from '../lib/exec';
-import { YTDLP_PATH, ffmpegLocation } from '../lib/binaries';
+import { ytdlpPath, ffmpegLocation } from '../lib/binaries';
 import { upstreamFailure } from '../lib/errors';
 import { logger } from '../lib/logger';
 import { env } from '../config/env';
@@ -11,6 +12,14 @@ import { activeProxy, rotateProxy } from './proxy.service';
 /** The subset of yt-dlp's `-J` output this app relies on. */
 export interface RawFormat {
   format_id?: string;
+  /**
+   * Direct media URL. Handed to the browser by /api/resolve so the client can fetch the
+   * bytes over its own connection instead of through our egress.
+   */
+  url?: string | null;
+  /** Present on adaptive formats; lets a client map a time range onto a byte range. */
+  init_range?: { start?: number; end?: number } | null;
+  index_range?: { start?: number; end?: number } | null;
   ext?: string;
   vcodec?: string | null;
   acodec?: string | null;
@@ -185,7 +194,7 @@ function baseArgs(): string[] {
     // extractor would override the first rather than merge with it.
     const parts: string[] = [];
 
-    const client = env.ytdlp.playerClients[clientCursor];
+    const client = env.ytdlp.playerClients[currentClientIndex()];
     // `default` means "let yt-dlp choose", so it contributes nothing.
     if (client && client !== 'default') parts.push(`player_client=${client}`);
 
@@ -233,20 +242,30 @@ function isFormatUnavailable(error: unknown): boolean {
   );
 }
 
-/** Index into env.ytdlp.playerClients for the client the next call will use. */
-let clientCursor = 0;
+/**
+ * Where the *next* operation starts its search. Sticky so a client that works keeps being
+ * used, but it is only ever advanced by a successful call — never mid-retry, or concurrent
+ * requests would move each other's position.
+ */
+let stickyClientIndex = 0;
 
 /**
- * Advances to the next client, wrapping around. The cursor is deliberately sticky across
- * requests so a client that works keeps being used, but it wraps so that a request which
- * starts mid-list still gets to try the entries before it.
+ * Per-operation client position. Two requests rotating at the same time each need their
+ * own cursor; a shared one makes them skip clients and trample each other's retries.
  */
-function advancePlayerClient(reason: string): void {
+const clientScope = new AsyncLocalStorage<{ index: number }>();
+
+/** The client this call should use: the operation's own cursor, else the sticky one. */
+function currentClientIndex(): number {
+  return clientScope.getStore()?.index ?? stickyClientIndex;
+}
+
+function advancePlayerClient(store: { index: number }, reason: string): void {
   const clients = env.ytdlp.playerClients;
   if (clients.length === 0) return;
 
-  clientCursor = (clientCursor + 1) % clients.length;
-  logger.warn(`${reason} — retrying with player_client=${clients[clientCursor]}.`);
+  store.index = (store.index + 1) % clients.length;
+  logger.warn(`${reason} — retrying with player_client=${clients[store.index]}.`);
 }
 
 /**
@@ -263,33 +282,52 @@ async function withUnblockRetries<T>(operation: () => Promise<T>): Promise<T> {
     ? 1
     : Math.max(1, env.ytdlp.playerClients.length);
 
-  let clientsTried = 1;
+  const store = { index: stickyClientIndex };
+  const deadline = Date.now() + env.ytdlp.unblockDeadlineMs;
 
-  for (;;) {
-    try {
-      return await operation();
-    } catch (error) {
-      const blocked = isBlockedByYoutube(error);
-      const emptyClient = isFormatUnavailable(error);
-      if (!blocked && !emptyClient) throw error;
+  return clientScope.run(store, async () => {
+    let clientsTried = 1;
 
-      if (clientsTried < clientBudget) {
-        clientsTried += 1;
-        advancePlayerClient(
-          blocked ? 'YouTube blocked the request' : 'That client returned no usable formats',
-        );
-        continue;
+    for (;;) {
+      try {
+        const result = await operation();
+        // Remember what worked so the next request starts there instead of re-probing.
+        stickyClientIndex = store.index;
+        return result;
+      } catch (error) {
+        const blocked = isBlockedByYoutube(error);
+        const emptyClient = isFormatUnavailable(error);
+        if (!blocked && !emptyClient) throw error;
+
+        // Each client can cost 20s+; without a ceiling the HTTP caller times out first
+        // and the work is wasted anyway.
+        if (Date.now() > deadline) {
+          logger.warn(
+            `Giving up unblock retries after ${env.ytdlp.unblockDeadlineMs}ms — ` +
+              `tried ${clientsTried} player client(s).`,
+          );
+          throw error;
+        }
+
+        if (clientsTried < clientBudget) {
+          clientsTried += 1;
+          advancePlayerClient(
+            store,
+            blocked ? 'YouTube blocked the request' : 'That client returned no usable formats',
+          );
+          continue;
+        }
+
+        // Out of clients: a new exit IP is the only thing left worth trying.
+        if (blocked && rotateProxy()) {
+          clientsTried = 1;
+          continue;
+        }
+
+        throw error;
       }
-
-      // Out of clients: a new exit IP is the only thing left worth trying.
-      if (blocked && rotateProxy()) {
-        clientsTried = 1;
-        continue;
-      }
-
-      throw error;
     }
-  }
+  });
 }
 
 /** True when yt-dlp's helper ffmpeg died on a signal (code -11 is SIGSEGV). */
@@ -365,7 +403,7 @@ function describeFailure(error: unknown): string {
 export async function fetchVideoInfo(url: string): Promise<RawVideoInfo> {
   try {
     const { stdout } = await withUnblockRetries(() =>
-      run(YTDLP_PATH, [...baseArgs(), '--no-progress', '-J', url], { timeoutMs: 90_000 }),
+      run(ytdlpPath(), [...baseArgs(), '--no-progress', '-J', url], { timeoutMs: 90_000 }),
     );
     const parsed = JSON.parse(stdout) as RawVideoInfo;
     if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.formats)) {
@@ -502,7 +540,7 @@ async function attemptSection(
       // Each attempt starts from a clean directory so a blocked run leaves nothing behind.
       await clearWorkDir(options.outputTemplate);
 
-      return run(YTDLP_PATH, sectionArgs(options, forceKeyframes), {
+      return run(ytdlpPath(), sectionArgs(options, forceKeyframes), {
         timeoutMs: options.timeoutMs ?? 20 * 60_000,
         onStdoutLine: (line) => {
           const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());
@@ -613,7 +651,7 @@ export async function downloadFullFormat(options: DownloadFormatOptions): Promis
     await withUnblockRetries(async () => {
       await clearWorkDir(options.outputTemplate);
 
-      return run(YTDLP_PATH, buildArgs(), {
+      return run(ytdlpPath(), buildArgs(), {
         timeoutMs: options.timeoutMs ?? 25 * 60_000,
         onStdoutLine: (line) => {
           const match = PROGRESS_PATTERN.exec(line.replace(/%/g, '').trim());

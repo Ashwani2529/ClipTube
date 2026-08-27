@@ -3,7 +3,7 @@ import type { Server } from 'http';
 import { createApp } from './app';
 import { env } from './config/env';
 import { connectDatabase, disconnectDatabase } from './config/db';
-import { BINARY_PATHS, stageFfmpegDirectory } from './lib/binaries';
+import { binaryPaths, isServerToolingAvailable, stageFfmpegDirectory } from './lib/binaries';
 import { logger } from './lib/logger';
 import { startCleanupSchedule, stopCleanupSchedule } from './services/cleanup.service';
 import { prepareCookieFile } from './services/ytdlp.service';
@@ -35,17 +35,25 @@ async function bootstrap(): Promise<void> {
 
   await logBuildIdentity();
 
-  Object.entries(BINARY_PATHS).forEach(([name, binaryPath]) => {
-    logger.info(`${name}: ${binaryPath}`);
-  });
-
   await fs.mkdir(env.tempDir, { recursive: true });
   logger.info(`Temp directory: ${env.tempDir}`);
 
-  // yt-dlp needs ffmpeg and ffprobe side by side; see stageFfmpegDirectory().
-  await stageFfmpegDirectory();
-  await prepareCookieFile();
-  startProxyPool();
+  // Everything from here to the end of the block belongs to the *server fallback*. The
+  // browser-first path needs none of it, so a deployment without these binaries still boots
+  // and serves /resolve, /telemetry and /metrics — the fallback simply reports itself
+  // unavailable and the client path carries every request.
+  if (isServerToolingAvailable()) {
+    Object.entries(binaryPaths()).forEach(([name, binaryPath]) => {
+      logger.info(`${name}: ${binaryPath}`);
+    });
+
+    // yt-dlp needs ffmpeg and ffprobe side by side; see stageFfmpegDirectory().
+    await stageFfmpegDirectory();
+    await prepareCookieFile();
+    startProxyPool();
+  } else {
+    logger.warn('Server-side extraction is unavailable; running browser-first only.');
+  }
 
   await connectDatabase();
   await startCleanupSchedule();

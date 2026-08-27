@@ -1,6 +1,6 @@
 import net from 'net';
 import { env } from '../config/env';
-import { YTDLP_PATH } from '../lib/binaries';
+import { ytdlpPath } from '../lib/binaries';
 import { run } from '../lib/exec';
 import { logger } from '../lib/logger';
 
@@ -187,10 +187,21 @@ const TCP_TIMEOUT_MS = 3_000;
 const VALIDATION_SHORTLIST_FACTOR = 6;
 
 const TCP_CONCURRENCY = 40;
-const VALIDATE_CONCURRENCY = 4;
 
-/** Ceiling on yt-dlp validation runs per refresh, so a bad list can't spin forever. */
-const MAX_VALIDATION_ATTEMPTS = 60;
+/**
+ * Validation spawns a real yt-dlp process per candidate. On a small instance (Render's
+ * free tier is a fraction of a CPU) more than a couple at once starves the API itself,
+ * which shows up as request timeouts while the pool is being built.
+ */
+const VALIDATE_CONCURRENCY = 2;
+
+/**
+ * Ceiling on yt-dlp validation runs per refresh. Kept low deliberately: public lists are
+ * dominated by port-80 hosts that answer a TCP connect without being usable proxies at
+ * all, so passing the cheap check says very little and grinding through hundreds of them
+ * costs minutes for almost no chance of a hit.
+ */
+const MAX_VALIDATION_ATTEMPTS = 16;
 
 /** Don't rebuild the pool more than once every few minutes. */
 const REFRESH_COOLDOWN_MS = 3 * 60_000;
@@ -296,7 +307,7 @@ function tcpReachable(entry: ProxyEntry): Promise<boolean> {
 async function servesYoutube(entry: ProxyEntry): Promise<boolean> {
   try {
     await run(
-      YTDLP_PATH,
+      ytdlpPath(),
       [
         '--no-playlist',
         '--no-warnings',

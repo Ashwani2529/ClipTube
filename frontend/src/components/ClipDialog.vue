@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { formatBytes, formatClock, formatDuration } from '../lib/time'
-import { useClipJob } from '../lib/useClipJob'
+import type { ClipControllerApi } from '../services/clipController'
 import type { ClipRange, ClipType, FormatsResponse } from '../types'
 
 type Tab = 'video' | 'audio' | 'info'
@@ -13,6 +13,8 @@ const props = defineProps<{
   formats: FormatsResponse | null
   url: string
   range: ClipRange
+  /** Owns the strategy ladder; this component only reports what it is doing. */
+  controller: ClipControllerApi
 }>()
 
 const emit = defineEmits<{
@@ -33,15 +35,46 @@ const videoFormatId = ref<string | null>(null)
 const audioFormatId = ref<string | null>(null)
 const dialogEl = ref<HTMLDivElement | null>(null)
 
-const {
-  phase: jobPhase,
-  progress: jobProgress,
-  message: jobMessage,
-  error: jobError,
-  fileName: jobFileName,
-  start: startJob,
-  reset: resetJob,
-} = useClipJob()
+/**
+ * The controller exposes a twelve-state machine; the dialog only needs to know whether it
+ * is idle, busy, finished or broken. Collapsing it here keeps the template unchanged and
+ * keeps strategy names out of the UI — the user should never see "client processing failed"
+ * when the server is already picking the work up.
+ */
+type DialogPhase = 'idle' | 'starting' | 'working' | 'ready' | 'failed'
+
+const jobPhase = computed<DialogPhase>(() => {
+  switch (props.controller.state.value) {
+    case 'URL_VALIDATING':
+    case 'CLIENT_RESOLUTION':
+      return 'starting'
+    case 'CLIENT_PROCESSING':
+    case 'SERVER_PROCESSING':
+    case 'SERVER_FALLBACK':
+      return 'working'
+    case 'COMPLETED':
+      return 'ready'
+    case 'CLIENT_RESOLUTION_FAILED':
+    case 'CLIENT_PROCESSING_FAILED':
+    case 'SERVER_PROCESSING_FAILED':
+    case 'ERROR':
+      return 'failed'
+    default:
+      return 'idle'
+  }
+})
+
+// The template renders an indeterminate bar at 0, which is exactly what a null percentage
+// should look like.
+const jobProgress = computed(() => props.controller.progress.value ?? 0)
+const jobMessage = computed(() => props.controller.message.value)
+const jobError = computed(() => props.controller.error.value)
+const jobFileName = ref<string | null>(null)
+
+const resetJob = () => {
+  jobFileName.value = null
+  props.controller.reset()
+}
 
 const meta = computed(() => props.formats?.meta ?? null)
 const videoOptions = computed(() => props.formats?.video ?? [])
@@ -98,11 +131,14 @@ watch(
   () => props.open,
   (open) => {
     if (open) {
-      resetJob()
+      // Deliberately no reset here: the parent starts resolving in the same tick that it
+      // opens the dialog, and this watcher runs afterwards — resetting would abort the
+      // request that is already in flight. Teardown happens on close instead.
       window.addEventListener('keydown', onKeydown)
       document.body.style.overflow = 'hidden'
       void Promise.resolve().then(() => dialogEl.value?.focus())
     } else {
+      resetJob()
       window.removeEventListener('keydown', onKeydown)
       document.body.style.overflow = ''
     }
@@ -118,25 +154,34 @@ function onBackdrop(event: MouseEvent | PointerEvent) {
   if (event.target === event.currentTarget) close()
 }
 
-async function download(type: ClipType) {
-  const formatId = type === 'video' ? videoFormatId.value : audioFormatId.value
-  if (!formatId) return
-
-  const jobId = await startJob({
-    url: props.url,
-    start: props.range.start,
-    end: props.range.end,
-    type,
-    formatId,
-  })
-
-  if (jobId) emit('started')
-}
-
 const targetExtension = computed(() => {
   if (tab.value === 'audio') return selectedAudio.value?.group.ext ?? 'm4a'
   return 'mp4'
 })
+
+async function download(type: ClipType) {
+  const formatId = type === 'video' ? videoFormatId.value : audioFormatId.value
+  if (!formatId) return
+
+  const ext = type === 'audio' ? (selectedAudio.value?.group.ext ?? 'm4a') : 'mp4'
+
+  const artifact = await props.controller.runClip({
+    start: props.range.start,
+    end: props.range.end,
+    type,
+    formatId,
+    height: type === 'video' ? (selectedVideo.value?.height ?? null) : null,
+    ext,
+    title: meta.value?.title ?? 'clip',
+  })
+
+  if (artifact) {
+    jobFileName.value = artifact.fileName
+    // Only a server job increments the backend counter, so the stats card is refreshed
+    // whenever one ran. A purely client-side clip never touches it.
+    if (props.controller.serverJobId.value) emit('started')
+  }
+}
 
 /**
  * yt-dlp reports sizes for the whole video, so scale them down to the selected range —

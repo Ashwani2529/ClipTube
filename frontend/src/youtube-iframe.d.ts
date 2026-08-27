@@ -48,6 +48,16 @@ declare namespace YT {
     getDuration(): number
     getPlayerState(): number
     loadVideoById(videoId: string | { videoId: string; startSeconds?: number }): void
+    /** Quality ids YouTube says it can serve, e.g. `['hd1080', 'hd720', 'medium']`. */
+    getAvailableQualityLevels(): string[]
+    /**
+     * A hint only. YouTube has ignored this since it moved to adaptive streaming, so the
+     * capture path treats the result as advisory and records what it actually got.
+     */
+    setPlaybackQuality(quality: string): void
+    mute(): void
+    unMute(): void
+    isMuted(): boolean
     destroy(): void
   }
 }

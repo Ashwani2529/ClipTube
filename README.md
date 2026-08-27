@@ -16,25 +16,41 @@ full-length download, no re-encoding, no editor.
 - **Format picker** listing exactly what `yt-dlp` reports for that video — one entry per
   resolution (360p → 4K, HDR flagged) and original audio codecs (`m4a`, `opus`, …) with a
   bitrate tier each. Dubbed tracks are filtered out when an original-language track exists.
-- **Precise cuts** — the section is fetched with keyframes forced at the cut points, then
-  probed and trimmed if it overruns.
-- **No transcoding** — the `ffmpeg` pass is a stream copy that only fixes the container and
-  moves the mp4 index to the front for instant seeking.
+- **Browser-first extraction** — the YouTube-facing work runs in your own browser over your
+  own connection wherever it can, so clips are not funnelled through a shared server IP.
+  The server is a fallback, not the default route.
+- **Precise cuts** — the clip is trimmed to the exact range, stream-copied rather than
+  re-encoded whenever the source allows it.
 - **Named output** — files arrive as `{video-title}-clip.{ext}`.
 - **Live progress** while the clip is built, then a direct browser save.
 - **All-time download counter**, persisted in MongoDB.
 - **Self-cleaning storage** — a clip is deleted the moment its download finishes, and an
   hourly sweep clears anything orphaned.
 
+## How extraction works
+
+ClipTube tries the user's own device before its backend, and falls back transparently:
+
+| Stage | Preferred | Fallback |
+| --- | --- | --- |
+| Metadata | `youtube.com/oembed` + the IFrame player, both from the browser | `POST /api/resolve` (yt-dlp) |
+| Media bytes | fetched by the browser, or captured from the embedded player | yt-dlp on the server |
+| Trim / remux | `ffmpeg.wasm`, loaded lazily on first use | `ffmpeg` on the server |
+
+Browser JavaScript cannot read YouTube's media URLs directly — `/youtubei/v1/player`
+refuses cross-origin requests — so the fully client-side path records the embedded player
+rather than downloading from the CDN. `GET /api/metrics` reports how often each path wins.
+
 ## Tech stack
 
-**Frontend** — Vite · Vue 3 (`<script setup>`) · TypeScript · axios. Custom slider and
-modal, no UI framework. Light theme only.
+**Frontend** — Vite · Vue 3 (`<script setup>`) · TypeScript · axios · `ffmpeg.wasm`
+(lazy-loaded). Custom slider and modal, no UI framework. Light theme only.
 
 **Backend** — Node.js · Express 5 · TypeScript · Mongoose / MongoDB · node-cron ·
 fluent-ffmpeg.
 
-**Media** — `yt-dlp` and `ffmpeg`, spawned as child processes.
+**Media** — `ffmpeg.wasm` in the browser; `yt-dlp` and `ffmpeg` as child processes on the
+server fallback.
 
 ---
 

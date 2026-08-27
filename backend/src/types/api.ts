@@ -52,6 +52,30 @@ export interface FormatsResponse {
   audio: AudioFormatGroup[];
 }
 
+/**
+ * Answer to POST /api/resolve. Metadata and format lists only — this endpoint never streams
+ * media. `direct` carries signed stream URLs so the browser can fetch the bytes itself.
+ */
+export interface ResolveResponse {
+  videoId: string;
+  meta: VideoMeta;
+  video: VideoFormatOption[];
+  audio: AudioFormatGroup[];
+  direct: {
+    streams: Array<{
+      formatId: string;
+      url: string;
+      mimeType: string;
+      contentLength: number | null;
+      hasAudio: boolean;
+      hasVideo: boolean;
+      ext: string;
+    }>;
+    /** Epoch ms after which the URLs stop working, when YouTube tells us. */
+    expiresAt: number | null;
+  } | null;
+}
+
 export interface ClipRequestBody {
   url?: unknown;
   start?: unknown;

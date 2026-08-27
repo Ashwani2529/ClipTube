@@ -2,8 +2,8 @@ import axios, { AxiosError } from 'axios'
 import type {
   ClipResponse,
   ClipType,
-  FormatsResponse,
   JobStatusResponse,
+  ResolveResponse,
   StatsResponse,
 } from '../types'
 
@@ -21,11 +21,6 @@ export function describeError(error: unknown, fallback: string): string {
     if (!error.response) return 'Could not reach the ClipTube server. Is the backend running?'
   }
   return error instanceof Error && error.message ? error.message : fallback
-}
-
-export async function fetchFormats(url: string): Promise<FormatsResponse> {
-  const { data } = await client.post<FormatsResponse>('/formats', { url })
-  return data
 }
 
 export interface CreateClipInput {
@@ -46,9 +41,30 @@ export async function fetchJobStatus(jobId: string): Promise<JobStatusResponse> 
   return data
 }
 
+/**
+ * Server-side resolution, used only after the browser's own attempt has failed. Returns
+ * metadata and — when YouTube supplies them — stream URLs the browser can fetch itself, so
+ * even this path can keep the media off our backend.
+ */
+export async function resolveVideoOnServer(
+  url: string,
+  signal?: AbortSignal,
+): Promise<ResolveResponse> {
+  const { data } = await client.post<ResolveResponse>('/resolve', { url }, { signal })
+  return data
+}
+
 export async function fetchStats(): Promise<StatsResponse> {
   const { data } = await client.get<StatsResponse>('/stats')
   return data
+}
+
+/**
+ * Fire-and-forget experiment telemetry. Given its own short timeout and no retry: a slow or
+ * missing metrics endpoint must never delay a clip the user has already received.
+ */
+export async function reportTelemetry(record: unknown): Promise<void> {
+  await client.post('/telemetry', record, { timeout: 4_000 })
 }
 
 export const downloadUrlFor = (jobId: string): string => `${API_BASE}/download/${jobId}`
